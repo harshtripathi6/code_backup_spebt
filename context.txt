@@ -1,0 +1,3290 @@
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_analyze_extracted_properties.py =====
+import torch
+import h5py
+import os
+import sys
+
+if __name__ == "__main__":
+    # --- MODIFICATION: Get layout_idx from a command-line argument ---
+    if len(sys.argv) != 2:
+        print("Usage: python generate_asci_histogram_task.py <layout_idx>")
+        sys.exit(1)
+    try:
+        layout_idx = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: <layout_idx> must be an integer. Received: {sys.argv[1]}")
+        sys.exit(1)
+
+    print(f"--- Starting ASCI histogram generation for layout index: {layout_idx} ---")
+
+    # --- Configuration ---
+    n_bins = 360
+    angular_bin_boundaries = torch.arange(n_bins + 1) / 180 * torch.pi
+    input_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs_3mm_aperture_displaced_24ph"
+
+    # --- Data Loading ---
+    print("Loading beams properties and masks...")
+    try:
+        # Load the beams properties
+        beams_properties_hdf5_filename = f"beams_properties_configuration_{layout_idx:03d}.hdf5"
+        with h5py.File(os.path.join(input_dir, beams_properties_hdf5_filename), "r") as f:
+            layout_beams_properties = torch.from_numpy(f["beam_properties"][:])
+            beam_properties_header = f["beam_properties"].attrs["Header"]
+
+        # Load the beams masks for the layout
+        beams_masks_hdf5_filename = f"beams_masks_configuration_{layout_idx:03d}.hdf5"
+        with h5py.File(os.path.join(input_dir, beams_masks_hdf5_filename), "r") as beams_masks_hdf5:
+            beams_masks = torch.from_numpy(beams_masks_hdf5["beam_mask"][:])
+    except FileNotFoundError as e:
+        print(f"Error: Input file not found for layout {layout_idx}. Make sure previous steps ran successfully.")
+        print(e)
+        sys.exit(1)
+
+    # --- Data Processing ---
+    print("Processing data and building histogram...")
+    
+    # Digitize the angles
+    digitized_angles = torch.bucketize(
+        layout_beams_properties[:, 3], angular_bin_boundaries, right=False
+    )
+    # Note: The original script had this block duplicated. One is sufficient.
+    layout_beams_properties = torch.cat(
+        (layout_beams_properties, (digitized_angles - 1).unsqueeze(1).float()),
+        dim=1,
+    )
+    
+    # Filter out beams with NaN angles
+    layout_beams_properties_filtered = layout_beams_properties[
+        torch.isnan(layout_beams_properties[:, 3]) == False
+    ]
+
+    # Filter by sensitivity (optional, kept from original script)
+    if layout_beams_properties_filtered[:, 7].numel() > 0:
+        beams_sensitivity_max = layout_beams_properties_filtered[:, 7].max()
+    else:
+        # Handle the empty case: set a default value, log a warning, etc.
+        beams_sensitivity_max = 0.0  # Or float('-inf'), None, etc.
+        print("Warning: No beams matched the filter criteria.")
+        
+    layout_beams_properties_filtered = layout_beams_properties_filtered[
+        layout_beams_properties_filtered[:, 7] > beams_sensitivity_max * 0.01
+    ]
+    
+    print(f"Found {layout_beams_properties_filtered.shape[0]} valid beams to process.")
+
+    # Initialize the histogram for ASCI map
+    asci_histogram = torch.zeros((280 * 280, n_bins), dtype=torch.int32)
+
+    # Loop through the beams and populate the histogram
+    for beam_props in layout_beams_properties_filtered:
+        detector_idx = int(beam_props[1])
+        beam_idx = int(beam_props[2])
+        # The angle bin index is now the last column (index 11 after cat)
+        angle_bin_idx = int(beam_props[-1]) 
+        
+        # Ensure angle_bin_idx is valid before using it
+        if 0 <= angle_bin_idx < n_bins:
+            asci_histogram[beams_masks[detector_idx] == beam_idx, angle_bin_idx] += 1
+
+    # --- Save the Output ---
+    asci_histogram_filename = os.path.join(input_dir, f"asci_histogram_{layout_idx:03d}.hdf5")
+    print(f"Saving histogram to: {asci_histogram_filename}")
+    with h5py.File(asci_histogram_filename, "w") as f:
+        f.create_dataset("asci_histogram", data=asci_histogram.numpy())
+
+    print(f"--- Finished ASCI histogram generation for layout index: {layout_idx} ---")
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_analyze_extracted_properties.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_compute_ppds.py =====
+#!/usr/bin/env python3
+import os, sys, h5py, torch
+import matplotlib
+matplotlib.use("Agg")  # headless save
+import matplotlib.pyplot as plt
+
+# --- your modules ----------------------------------------------------
+from geometry_2d_io import load_scanner_layout_geometries, load_scanner_layouts
+from geometry_2d_utils import fov_tensor_dict, pixels_coordinates, pixels_to_detector_unit_rads
+from convex_hull_helper import convex_hull_2d, sort_points_for_hull_batch_2d
+from ppdf_io import load_ppdfs_data_from_hdf5
+from beam_property_extract import (
+    sample_ppdf_on_arc_2d_local,
+    beams_boundaries_radians,
+    get_beams_masks,
+    get_beams_weighted_center,
+    get_beam_width,                 # tangential FWHM (perpendicular to axis)
+    beam_samples_on_points_batch,   # reuse for radial sampling
+    full_width_half_maximum_1d_batch,
+)
+# ---------------------------------------------------------------------
+
+# ------------------------- helpers -----------------------------------
+@torch.no_grad()
+def _beam_axis_sampling_line_batch(
+    detector_center: torch.Tensor,
+    beam_centers: torch.Tensor,
+    n_samples: int = 4096,
+    length_mm: float = 64.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sampling line *along* the beam axis (radial)."""
+    n_beams = beam_centers.shape[0]
+    axis = torch.atan2(beam_centers[:, 1] - detector_center[1],
+                       beam_centers[:, 0] - detector_center[0])
+    kx, ky = torch.cos(axis), torch.sin(axis)
+    dist = torch.linspace(-length_mm/2, length_mm/2, n_samples, dtype=torch.float32, device=beam_centers.device)
+    pts  = torch.stack((kx, ky), dim=1).unsqueeze(1).expand(-1, n_samples, -1) \
+           * dist.view(1, n_samples, 1) + beam_centers.unsqueeze(1).expand(-1, n_samples, -1)
+    return pts, dist
+
+@torch.no_grad()
+def _get_beam_width_radial(
+    beams_centers: torch.Tensor,
+    detector_center: torch.Tensor,
+    beams_masks: torch.Tensor,
+    ppdf_2d: torch.Tensor,
+    fov_dict: dict,
+    line_n_samples: int = 4096,
+):
+    """Radial FWHM by sampling *along* the axis."""
+    pts_batch, dist = _beam_axis_sampling_line_batch(
+        detector_center, beams_centers, n_samples=line_n_samples, length_mm=64.0
+    )
+    n_beams = beams_centers.shape[0]
+    beams_data_2d_batch = (
+        ppdf_2d.view(-1).unsqueeze(0).expand(n_beams, -1).clone().masked_fill_(~beams_masks, 0)
+    ).view(n_beams, int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1]))
+    sampled = beam_samples_on_points_batch(beams_data_2d_batch, pts_batch, fov_dict)
+    fwhm, x_bounds = full_width_half_maximum_1d_batch(
+        dist.view(1, -1).expand(n_beams, -1), sampled
+    )
+    return fwhm, x_bounds, sampled, dist
+# ---------------------------------------------------------------------
+
+
+@torch.no_grad()
+def compute_ppds_for_layout(
+    layout_idx: int,
+    scanner_layouts_dir: str,
+    scanner_layouts_filename: str,
+    ppdfs_dir: str,
+    out_dir: str,
+    threshold_relative: float = 0.01,
+    line_n_samples: int = 4096,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- load meta and data ------------------------------------------
+    layouts_data, layouts_uid = load_scanner_layouts(scanner_layouts_dir, scanner_layouts_filename)
+    fov = fov_tensor_dict(n_pixels=(280, 280), mm_per_pixel=(0.25, 0.25), center_coordinates=(0.0, 0.0))
+    _, det_units = load_scanner_layout_geometries(layout_idx, layouts_data)
+
+    # match your Block-2 naming convention
+    ppdf_h5 = f"scanner_layouts_{layouts_uid}_layout_{layout_idx:03d}_3x3_subvoxels.hdf5"
+    ppdfs = load_ppdfs_data_from_hdf5(ppdfs_dir, ppdf_h5, fov)  # (n_crystals, npx, npy)
+    n_det = int(det_units.shape[0])
+
+    det_centers = det_units.mean(dim=1)
+    fov_corners = (torch.tensor([[-1,-1],[1,-1],[1,1],[-1,1]], dtype=torch.float32) * fov["size in mm"] * 0.5)
+    hull_points_batch = torch.cat(
+        (fov_corners.unsqueeze(0).expand(n_det, -1, -1), det_centers.unsqueeze(1)),
+        dim=1
+    )
+    hull_points_batch = sort_points_for_hull_batch_2d(hull_points_batch)
+
+    # outputs
+    PPDS = torch.zeros(int(fov["n pixels"][0]), int(fov["n pixels"][1]), dtype=torch.float32)
+    SENS = torch.zeros_like(PPDS)
+    V_i  = torch.zeros(n_det, dtype=torch.float32)
+
+    for i in range(n_det):
+        ppdf2d = ppdfs[i].view(int(fov["n pixels"][0]), int(fov["n pixels"][1]))
+        center = det_centers[i]
+        hull   = convex_hull_2d(hull_points_batch[i])
+
+        # arc sampling -> beam boundaries
+        sampled, rads, _ = sample_ppdf_on_arc_2d_local(ppdf2d, center, hull, fov)
+        # IMPORTANT: your dependency has only (arc, rads, threshold)
+        bounds = beams_boundaries_radians(sampled, rads, threshold=threshold_relative)
+
+        # conventional sensitivity always sums PPDFs
+        SENS += ppdf2d
+
+        if bounds.numel() == 0:
+            continue
+
+        # masks & centers
+        fov_xy   = pixels_coordinates(fov)
+        fov_rads = pixels_to_detector_unit_rads(fov_xy, center)
+        masks    = get_beams_masks(fov_rads, bounds)           # (n_beams, n_pixels)
+        centers  = get_beams_weighted_center(masks, fov_xy, ppdf2d)
+
+        # tangential width (perpendicular)
+        fwhm_tan, _, _, _ = get_beam_width(
+            centers, center, masks, ppdf2d, fov, line_n_samples=line_n_samples
+        )
+
+        # radial width (along axis)
+        fwhm_rad, _, _, _ = _get_beam_width_radial(
+            centers, center, masks, ppdf2d, fov, line_n_samples=line_n_samples
+        )
+
+        eps = 1e-6
+        fwhm_tan = torch.nan_to_num(fwhm_tan, nan=0.0).clamp_min(0.0)
+        fwhm_rad = torch.nan_to_num(fwhm_rad, nan=0.0).clamp_min(0.0)
+
+        Vi_b = fwhm_tan * fwhm_rad
+        Vi   = float(torch.sum(Vi_b).item())
+        if Vi <= eps:
+            continue
+
+        V_i[i] = Vi
+        PPDS += ppdf2d / Vi
+
+    # ---- save --------------------------------------------------------
+    out_h5 = os.path.join(out_dir, f"ppds_layout_{layout_idx:03d}.hdf5")
+    with h5py.File(out_h5, "w") as f:
+        f.create_dataset("PPDS", data=PPDS.numpy())
+        f.create_dataset("SENS", data=SENS.numpy())
+        f.create_dataset("V_i",  data=V_i.numpy())
+        f["PPDS"].attrs["definition"] = "sum_i PPDF_i / V_i, with V_i=sum_b FWHM_tan(i,b)*FWHM_rad(i,b)"
+        f["SENS"].attrs["definition"] = "conventional sensitivity: sum_i PPDF_i"
+        f.attrs["layout_idx"] = layout_idx
+        f.attrs["layouts_uid"] = layouts_uid
+        f.attrs["threshold_relative"] = threshold_relative
+        f.attrs["line_n_samples"] = line_n_samples
+
+    # ---- histogram of V_i -------------------------------------------
+    vals = V_i[V_i > 0]
+    if vals.numel() > 0:
+        fig, ax = plt.subplots(figsize=(7,5), layout="constrained")
+        ax.hist(vals.cpu().numpy(), bins=50)
+        ax.set_xlabel(r"$V_i$  (mm$^2$)  =  $\sum_b$ FWHM$_{i,b}^{\rm tan}$ × FWHM$_{i,b}^{\rm rad}$")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Layout {layout_idx:03d}: histogram of $V_i$ (n={vals.numel()})")
+        plt.savefig(os.path.join(out_dir, f"V_i_hist_layout_{layout_idx:03d}.png"), dpi=200)
+        plt.close(fig)
+
+    print(f"[OK] Wrote: {out_h5}")
+    if vals.numel() > 0:
+        print(f"[OK] Saved V_i histogram with {vals.numel()} nonzero entries.")
+
+# -------------------- NEW: average across layouts --------------------
+@torch.no_grad()
+def compute_ppds_average(
+    layout_indices,
+    ppds_dir: str,
+    out_dir: str,
+):
+    """
+    Build an average PPDS (and SENS) map across the given layouts.
+    Expects per-layout files named 'ppds_layout_XXX.hdf5' already present in ppds_dir.
+
+    Saves:
+      out_dir/ppds_layout_AVG.hdf5 with datasets:
+        - 'PPDS'  (float32): arithmetic mean over layouts of per-layout PPDS maps
+        - 'SENS'  (float32): arithmetic mean over layouts of per-layout SENS maps
+      and attributes: 'n_layouts', 'layout_indices', 'layouts_uid'
+    """
+    assert len(layout_indices) > 0, "No layout indices provided for averaging."
+
+    sum_PPDS = None
+    sum_SENS = None
+    layouts_uid = None
+    shape = None
+
+    found = []
+    for li in layout_indices:
+        h5_path = os.path.join(ppds_dir, f"ppds_layout_{li:03d}.hdf5")
+        if not os.path.exists(h5_path):
+            print(f"[WARN] Missing {h5_path}; skipping.")
+            continue
+
+        with h5py.File(h5_path, "r") as f:
+            PPDS_l = torch.from_numpy(f["PPDS"][...]).to(torch.float32)
+            SENS_l = torch.from_numpy(f["SENS"][...]).to(torch.float32)
+            uid    = f.attrs.get("layouts_uid", None)
+
+            if shape is None:
+                shape = PPDS_l.shape
+                sum_PPDS = torch.zeros_like(PPDS_l, dtype=torch.float32)
+                sum_SENS = torch.zeros_like(SENS_l, dtype=torch.float32)
+                layouts_uid = uid
+            else:
+                if PPDS_l.shape != shape:
+                    raise ValueError(f"Shape mismatch for layout {li}: {PPDS_l.shape} vs {shape}")
+
+            sum_PPDS += PPDS_l
+            sum_SENS += SENS_l
+            found.append(li)
+
+    n = len(found)
+    if n == 0:
+        raise FileNotFoundError("No per-layout PPDS files found; nothing to average.")
+
+    mean_PPDS = sum_PPDS / float(n)
+    mean_SENS = sum_SENS / float(n)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_h5 = os.path.join(out_dir, "ppds_layout_AVG.hdf5")
+    with h5py.File(out_h5, "w") as f:
+        f.create_dataset("PPDS", data=mean_PPDS.cpu().numpy())
+        f.create_dataset("SENS", data=mean_SENS.cpu().numpy())
+        f.attrs["n_layouts"] = n
+        f.attrs["layout_indices"] = found
+        if layouts_uid is not None:
+            f.attrs["layouts_uid"] = layouts_uid
+        f["PPDS"].attrs["definition"] = "Arithmetic mean over layouts of per-layout PPDS maps"
+        f["SENS"].attrs["definition"] = "Arithmetic mean over layouts of per-layout sensitivity (sum of PPDFs)"
+
+    print(f"[OK] Wrote average PPDS: {out_h5} (n={n}, layouts={found})")
+# ---------------------------------------------------------------------
+
+
+
+if __name__ == "__main__":
+    # Two modes:
+    #   1) Per-layout: python arg_compute_ppds.py <layout_idx>
+    #   2) Average:    python arg_compute_ppds.py avg <N>
+    #                  python arg_compute_ppds.py avg <start> <end>   (inclusive)
+
+    SCANNER_LAYOUTS_DIR  = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon"
+    SCANNER_LAYOUTS_FILE = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/3mm_config/scanner_layouts_636bed318120192d3b39fb33a7655ea8_rot20_trans1x1_step0x0.tensor"
+    PPDFS_DIR            = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdfs_20rots_3mm_aperture"
+    OUT_DIR              = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs"
+
+    if len(sys.argv) >= 2 and sys.argv[1].lower() in ("avg", "average", "mean"):
+        # Average mode
+        if len(sys.argv) == 3:
+            # avg N  -> layouts 0..N-1
+            try:
+                N = int(sys.argv[2])
+            except ValueError:
+                print("Error: N must be an integer.")
+                sys.exit(1)
+            indices = list(range(N))
+        elif len(sys.argv) == 4:
+            # avg start end  (inclusive)
+            try:
+                start = int(sys.argv[2]); end = int(sys.argv[3])
+            except ValueError:
+                print("Error: start/end must be integers.")
+                sys.exit(1)
+            if end < start:
+                print("Error: end must be >= start.")
+                sys.exit(1)
+            indices = list(range(start, end + 1))
+        else:
+            print("Usage:\n  python arg_compute_ppds.py avg <N>\n  python arg_compute_ppds.py avg <start> <end>")
+            sys.exit(1)
+
+        # Build average from already-computed per-layout files in OUT_DIR
+        compute_ppds_average(indices, OUT_DIR, OUT_DIR)
+        sys.exit(0)
+
+    # Per-layout mode
+    if len(sys.argv) != 2:
+        print("Usage: python arg_compute_ppds.py <layout_idx>\n   or : python arg_compute_ppds.py avg <N|start end>")
+        sys.exit(1)
+    try:
+        layout_idx = int(sys.argv[1])
+    except ValueError:
+        print("Error: <layout_idx> must be an integer.")
+        sys.exit(1)
+
+    compute_ppds_for_layout(
+        layout_idx,
+        SCANNER_LAYOUTS_DIR,
+        SCANNER_LAYOUTS_FILE,
+        PPDFS_DIR,
+        OUT_DIR,
+        threshold_relative=0.01,
+        line_n_samples=4096,
+    )
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_compute_ppds.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_extract_beam_masks.py =====
+import sys
+import os
+from torch import tensor, arange, cat
+from beam_property_extract import (
+    beams_boundaries_radians,
+    get_beams_masks,
+    get_beams_combined_mask,
+    sample_ppdf_on_arc_2d_local,
+)
+from convex_hull_helper import convex_hull_2d, sort_points_for_hull_batch_2d
+from geometry_2d_io import load_scanner_layout_geometries, load_scanner_layouts
+from geometry_2d_utils import (
+    fov_tensor_dict,
+    pixels_coordinates,
+    pixels_to_detector_unit_rads,
+)
+from ppdf_io import load_ppdfs_data_from_hdf5
+from beam_property_io import (
+    initialize_beam_masks_hdf5,
+    append_to_hdf5_dataset,
+)
+
+if __name__ == "__main__":
+    # --- MODIFICATION: Get layout_idx from a command-line argument ---
+    if len(sys.argv) != 2:
+        print("Usage: python process_beams_task.py <layout_idx>")
+        sys.exit(1)
+    try:
+        layout_idx = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: <layout_idx> must be an integer. Received: {sys.argv[1]}")
+        sys.exit(1)
+
+    print(f"--- Starting job for layout index: {layout_idx} ---")
+
+    # --- Define paths (ensure they are correct from the execution directory) ---
+    scanner_layouts_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon"
+    scanner_layouts_filename = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/scanner_layouts_71e7a1c93e5874311d77fd36727cb194_rot15_trans1x1_step0x0.tensor"
+    ppdfs_dataset_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdfs_15rots_3mm_aperture_displaced_24ph"
+    out_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs_3mm_aperture_displaced_24ph"
+
+    # Create output directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Load data and configuration ---
+    scanner_layouts_data, layouts_unique_id = load_scanner_layouts(
+        scanner_layouts_dir, scanner_layouts_filename
+    )
+    fov_dict = fov_tensor_dict(
+        n_pixels=(280, 280),
+        mm_per_pixel=(0.25, 0.25),
+        center_coordinates=(0.0, 0.0),
+    )
+    fov_n_pixels_int = int(fov_dict["n pixels"].prod())
+    
+    # --- Initialize HDF5 file for this specific layout ---
+    out_hdf5_filename = f"beams_masks_configuration_{layout_idx:03d}.hdf5"
+    out_hdf5_file, beams_masks_dataset = initialize_beam_masks_hdf5(
+        fov_n_pixels_int, out_hdf5_filename, out_dir
+    )
+    print(f"Output will be saved to: {os.path.join(out_dir, out_hdf5_filename)}")
+
+    # Load scanner geometry for the specific layout
+    plates_vertices, detector_units_vertices = load_scanner_layout_geometries(
+        int(layout_idx), scanner_layouts_data
+    )
+
+    # Load the corresponding PPDFs data
+    ppdfs_hdf5_filename = f"scanner_layouts_step0x0_layout_{layout_idx:03d}_3x3_subvoxels.hdf5"
+    ppdfs = load_ppdfs_data_from_hdf5(
+        ppdfs_dataset_dir, ppdfs_hdf5_filename, fov_dict
+    )
+
+    detector_unit_centers = detector_units_vertices.mean(dim=1)
+    fov_corners = (
+        tensor([[-1, -1], [1, -1], [1, 1], [-1, 1]])
+        * fov_dict["size in mm"]
+        * 0.5
+    )
+    hull_points_batch = cat(
+        (
+            fov_corners.unsqueeze(0).expand(detector_units_vertices.shape[0], -1, -1),
+            detector_unit_centers.unsqueeze(1),
+        ),
+        dim=1,
+    )
+    hull_points_batch = sort_points_for_hull_batch_2d(hull_points_batch)
+
+    n_detector_units = detector_units_vertices.shape[0]
+    detector_units_sequence = arange(0, n_detector_units)
+    print(f"Processing {n_detector_units} detector units for layout {layout_idx}...")
+
+    # --- Main processing loop for detector units (inner loop) ---
+    for detector_unit_idx in detector_units_sequence:
+        ppdf_data_2d = ppdfs[detector_unit_idx].view(
+            int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1])
+        )
+        hull_2d = convex_hull_2d(hull_points_batch[detector_unit_idx])
+        (sampled_ppdf, sampling_rads, sampling_points) = sample_ppdf_on_arc_2d_local(
+            ppdf_data_2d,
+            detector_unit_centers[detector_unit_idx],
+            hull_2d,
+            fov_dict,
+        )
+        beams_boundaries = beams_boundaries_radians(
+            sampled_ppdf, sampling_rads, threshold=0.01
+        )
+        fov_points_xy = pixels_coordinates(fov_dict)
+        fov_points_rads = pixels_to_detector_unit_rads(
+            fov_points_xy,
+            detector_unit_centers[detector_unit_idx],
+        )
+        beams_masks = get_beams_masks(fov_points_rads, beams_boundaries)
+        combined_beams_masks = get_beams_combined_mask(beams_masks)
+        
+        append_to_hdf5_dataset(beams_masks_dataset, combined_beams_masks)
+
+        if (detector_unit_idx + 1) % 200 == 0: # Log progress periodically
+            print(f"  ... processed {detector_unit_idx + 1}/{n_detector_units} detector units.")
+
+    print(f"\nLayout {layout_idx} Final Shape: {list(beams_masks_dataset.shape)}")
+    out_hdf5_file.close()
+    
+    print(f"--- Finished job for layout index: {layout_idx} ---")
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_extract_beam_masks.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_extract_beam_properties.py =====
+import sys
+import os
+from torch import cat, tensor, arange
+
+from beam_property_extract import (
+    beams_boundaries_radians,
+    get_beams_masks,
+    get_beams_weighted_center,
+    get_beam_width,
+    get_beams_angle_radian,
+    get_beams_basic_properties,
+    sample_ppdf_on_arc_2d_local,
+)
+from convex_hull_helper import convex_hull_2d, sort_points_for_hull_batch_2d
+from geometry_2d_io import load_scanner_layout_geometries, load_scanner_layouts
+from geometry_2d_utils import (
+    fov_tensor_dict,
+    pixels_coordinates,
+    pixels_to_detector_unit_rads,
+)
+from ppdf_io import load_ppdfs_data_from_hdf5
+from beam_property_io import (
+    initialize_beam_properties_hdf5,
+    append_to_hdf5_dataset,
+    stack_beams_properties,
+)
+
+if __name__ == "__main__":
+    # --- MODIFICATION: Get layout_idx from a command-line argument ---
+    if len(sys.argv) != 2:
+        print("Usage: python extract_beam_properties_task.py <layout_idx>")
+        sys.exit(1)
+    try:
+        layout_idx = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: <layout_idx> must be an integer. Received: {sys.argv[1]}")
+        sys.exit(1)
+
+    print(f"--- Starting beam property extraction for layout index: {layout_idx} ---")
+
+    # --- Define paths (ensure they are correct relative to execution directory) ---
+    scanner_layouts_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon"
+    scanner_layouts_filename = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/scanner_layouts_71e7a1c93e5874311d77fd36727cb194_rot15_trans1x1_step0x0.tensor"
+    ppdfs_dataset_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdfs_15rots_3mm_aperture_displaced_24ph"
+    out_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs_3mm_aperture_displaced_24ph"
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Load data and configuration ---
+    scanner_layouts_data, layouts_unique_id = load_scanner_layouts(
+        scanner_layouts_dir, scanner_layouts_filename
+    )
+    fov_dict = fov_tensor_dict(
+        n_pixels=(280, 280),
+        mm_per_pixel=(0.25, 0.25),
+        center_coordinates=(0.0, 0.0),
+    )
+    
+    # --- Initialize HDF5 file for this specific layout --- 
+    out_hdf5_filename = f"beams_properties_configuration_{layout_idx:03d}.hdf5"
+    out_hdf5_file, beam_properties_dataset = initialize_beam_properties_hdf5(
+        out_hdf5_filename, out_dir
+    )
+    print(f"Output will be saved to: {os.path.join(out_dir, out_hdf5_filename)}")
+
+    # Load scanner geometry and PPDFs for the specific layout
+    plates_vertices, detector_units_vertices = load_scanner_layout_geometries(
+        int(layout_idx), scanner_layouts_data
+    )
+    ppdfs_hdf5_filename = f"scanner_layouts_step0x0_layout_{layout_idx:03d}_3x3_subvoxels.hdf5"
+    ppdfs = load_ppdfs_data_from_hdf5(
+        ppdfs_dataset_dir, ppdfs_hdf5_filename, fov_dict
+    )
+
+    # --- Prepare for processing ---
+    detector_unit_centers = detector_units_vertices.mean(dim=1)
+    fov_corners = (
+        tensor([[-1, -1], [1, -1], [1, 1], [-1, 1]])
+        * fov_dict["size in mm"]
+        * 0.5
+    )
+    hull_points_batch = cat(
+        (
+            fov_corners.unsqueeze(0).expand(detector_units_vertices.shape[0], -1, -1),
+            detector_unit_centers.unsqueeze(1),
+        ),
+        dim=1,
+    )
+    hull_points_batch = sort_points_for_hull_batch_2d(hull_points_batch)
+
+    n_detector_units = int(detector_units_vertices.shape[0])
+    detector_units_sequence = arange(0, n_detector_units)
+    print(f"Processing {n_detector_units} detector units for layout {layout_idx}...")
+
+    # --- Main processing loop for detector units (the original inner loop) ---
+    for detector_unit_idx in detector_units_sequence:
+        ppdf_data_2d = ppdfs[detector_unit_idx].view(
+            int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1])
+        )
+        hull_2d = convex_hull_2d(hull_points_batch[detector_unit_idx])
+
+        (sampled_ppdf, sampling_rads, sampling_points) = sample_ppdf_on_arc_2d_local(
+            ppdf_data_2d,
+            detector_unit_centers[detector_unit_idx],
+            hull_2d,
+            fov_dict,
+        )
+
+        beams_boundaries = beams_boundaries_radians(
+            sampled_ppdf, sampling_rads, threshold=0.01
+        )
+
+        fov_points_xy = pixels_coordinates(fov_dict)
+        fov_points_rads = pixels_to_detector_unit_rads(
+            fov_points_xy, detector_unit_centers[detector_unit_idx]
+        )
+        beams_masks = get_beams_masks(fov_points_rads, beams_boundaries)
+        
+        if beams_masks.shape[0] == 0: # Skip if no beams were found
+            continue
+
+        beams_weighted_centers = get_beams_weighted_center(
+            beams_masks, fov_points_xy, ppdf_data_2d
+        )
+        (beams_fwhm, _, _, _) = get_beam_width(
+            beams_weighted_centers,
+            detector_unit_centers[detector_unit_idx],
+            beams_masks,
+            ppdf_data_2d,
+            fov_dict,
+        )
+        beams_angle = get_beams_angle_radian(
+            beams_weighted_centers, detector_unit_centers[detector_unit_idx]
+        )
+        (
+            beams_sizes,
+            beams_relative_sensitivity,
+            beams_absolute_sensitivity,
+        ) = get_beams_basic_properties(beams_masks, ppdf_data_2d, fov_points_xy)
+
+        stacked_beams_properties = stack_beams_properties(
+            int(layout_idx),
+            int(detector_unit_idx),
+            angles=beams_angle,
+            fwhms=beams_fwhm,
+            sizes=beams_sizes,
+            relative_sensitivities=beams_relative_sensitivity,
+            absolute_sensitivities=beams_absolute_sensitivity,
+            weighted_centers=beams_weighted_centers,
+        )
+
+        if stacked_beams_properties.numel():
+            append_to_hdf5_dataset(beam_properties_dataset, stacked_beams_properties)
+        
+        # Log progress periodically instead of using a progress bar
+        if (detector_unit_idx + 1) % 200 == 0:
+            print(f"  ... processed {detector_unit_idx + 1}/{n_detector_units} detector units.")
+
+    # --- Finalize ---
+    out_hdf5_file.close()
+    print(f"\nBeam properties for layout {layout_idx} saved successfully.")
+    print(f"--- Finished job for layout index: {layout_idx} ---")
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_extract_beam_properties.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_filter_ppdf_mpxi.py =====
+import torch
+import h5py
+import os
+import numpy as np
+from rich.progress import track
+import sys
+
+def filter_all_layouts_by_mpxi():
+    # --- 1. Configuration ---
+    # Adjust these paths and values as needed.
+
+    # Base directory where your data is stored
+    base_dir = "/vscratch/grp-rutaoyao/sid/data/mph_hourglass_single_position_base_2mm_20pinholes_rotated_18custom_rot"
+    out_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdfs"
+    
+    # Directory containing the original 'outputs' (properties, masks, ppdfs)
+    input_dir = os.path.join(base_dir, "outputs")
+
+    # !! New directory to save the filtered PPDFs !!
+    # This script will create this directory if it doesn't exist.
+    filtered_output_dir = os.path.join(out_dir, "filtered_outputs/mpxi_2") # Changed name
+    
+    # --- NEW: Multiplexing Filter Configuration ---
+    # !! CHECK THIS VALUE !! Look at the 'Header' attribute in your beams_properties file
+    MULTIPLEX_COLUMN_INDEX = 10
+    DESIRED_MULTIPLEX_VALUE = 2
+
+    # Total number of layouts to process
+    TOTAL_LAYOUTS = 18
+
+    # --- 2. Main Processing ---
+    os.makedirs(filtered_output_dir, exist_ok=True)
+    print(f"✅ Filtered PPDFs will be saved to: {filtered_output_dir}")
+    print(f"✅ Keeping beams with mpxi == {DESIRED_MULTIPLEX_VALUE}.")
+
+    # Loop over all scanner positions (layouts)
+    for layout_idx in track(range(TOTAL_LAYOUTS), description="Filtering PPDFs..."):
+        try:
+            # --- Load Data for the current Layout ---
+            # 1. Load Beam Properties and Header
+            props_fname = os.path.join(input_dir, f"beams_properties_configuration_{layout_idx:02d}.hdf5")
+            with h5py.File(props_fname, "r") as f:
+                properties = torch.from_numpy(f["beam_properties"][:])
+                # Robustly handle header stored as bytes or strings
+                header = [h.decode('utf-8') if isinstance(h, bytes) else h for h in f["beam_properties"].attrs["Header"]]
+
+            # 2. Load Beam Masks
+            masks_fname = os.path.join(input_dir, f"beams_masks_configuration_{layout_idx:02d}.hdf5")
+            with h5py.File(masks_fname, "r") as f:
+                masks = torch.from_numpy(f["beam_mask"][:])
+
+            # 3. Load Original PPDFs
+            ppdfs_fname = os.path.join(input_dir, f"position_{layout_idx:03d}_ppdfs.hdf5")
+            with h5py.File(ppdfs_fname, "r") as f:
+                original_ppdfs = torch.from_numpy(f["ppdfs"][:])
+
+        except FileNotFoundError as e:
+            print(f"\n⚠️ Skipping layout {layout_idx}, file not found: {e.filename}")
+            continue
+
+            
+        det_idx_col = header.index('detector unit id')
+        beam_idx_col = header.index('beam id')
+
+        mpxi_values = properties[:, MULTIPLEX_COLUMN_INDEX]
+        criteria_mask = (mpxi_values == DESIRED_MULTIPLEX_VALUE)
+        
+        good_beams_properties = properties[criteria_mask]
+        
+        if good_beams_properties.shape[0] == 0:
+            # print(f"\nℹ️ No beams found for layout {layout_idx} with MPXI = {DESIRED_MULTIPLEX_VALUE}. Skipping.")
+            # We still need to save an empty PPDF file to be consistent
+            pass
+
+        # --- Create a New Combined Mask from "Good" Beams Only ---
+        n_detectors = masks.shape[0]
+        final_filtered_mask = torch.zeros_like(masks, dtype=torch.bool)
+
+        for i in range(n_detectors):
+            # Find which of the "good" beams belong to the current detector unit
+            beams_for_this_detector = good_beams_properties[good_beams_properties[:, det_idx_col] == i]
+            
+            if len(beams_for_this_detector) > 0:
+                # Get the original beam IDs for the good beams
+                good_beam_indices = beams_for_this_detector[:, beam_idx_col].long()
+                
+                # Create a boolean mask for this detector that is True only for pixels
+                # that belong to one of the good beams.
+                detector_mask = torch.isin(masks[i], good_beam_indices)
+                final_filtered_mask[i] = detector_mask
+
+        # --- Apply the Final Mask and Save the New PPDF ---
+        # Element-wise multiplication zeros out the pixels from rejected beams
+        filtered_ppdfs = original_ppdfs * final_filtered_mask.float()
+        
+        # Save the new filtered PPDF file
+        output_fname = os.path.join(filtered_output_dir, f"position_{layout_idx:03d}_ppdfs.hdf5")
+        with h5py.File(output_fname, "w") as f:
+            f.create_dataset("ppdfs", data=filtered_ppdfs.numpy())
+
+    print("\n🚀 Filtering complete for all layouts!")
+
+if __name__ == "__main__":
+    filter_all_layouts_by_mpxi()
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_filter_ppdf_mpxi.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_plot_ppds_maps.py =====
+'''
+#!/usr/bin/env python3
+import os, sys, h5py, torch, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
+
+# project imports already in your tree
+from geometry_2d_io import load_scanner_layout_geometries, load_scanner_layouts
+from geometry_2d_utils import fov_tensor_dict
+
+def _polycollection_from_vertices(vertices: torch.Tensor, **kwargs):
+    """Build a fresh PolyCollection from (N,4,2) vertices for each figure."""
+    if vertices is None or vertices.numel() == 0:
+        return None
+    return PolyCollection(vertices.cpu().tolist(), **kwargs)
+
+def plot_ppds_maps(
+    layout_idx: int,
+    scanner_layouts_dir: str,
+    scanner_layouts_filename: str,
+    ppds_dir: str,
+    plot_dir: str,
+    cmap: str = "viridis",
+    overlay_geometry: bool = True,
+):
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # FOV info (280x280 @ 0.25 mm/px -> 70 mm square)
+    fov = fov_tensor_dict(n_pixels=(280, 280), mm_per_pixel=(0.25, 0.25), center_coordinates=(0.0, 0.0))
+    width_mm  = float(fov["size in mm"][0].item())
+    height_mm = float(fov["size in mm"][1].item())
+    extent = (-width_mm/2, width_mm/2, -height_mm/2, height_mm/2)
+
+    # Layout geometry (for overlay)
+    layouts_data, _ = load_scanner_layouts(scanner_layouts_dir, scanner_layouts_filename)
+    plate_vertices, det_vertices = load_scanner_layout_geometries(layout_idx, layouts_data)
+
+    # PPDS/SENS/V_i
+    ppds_h5 = os.path.join(ppds_dir, f"ppds_layout_{layout_idx:03d}.hdf5")
+    if not os.path.exists(ppds_h5):
+        raise FileNotFoundError(f"Missing {ppds_h5}. Generate it with arg_compute_ppds.py first.")
+    with h5py.File(ppds_h5, "r") as f:
+        PPDS = torch.from_numpy(f["PPDS"][...]).to(torch.float64)   # (H,W)
+        SENS = torch.from_numpy(f["SENS"][...]).to(torch.float64)
+        V_i  = torch.from_numpy(f["V_i"][...])                      # (n_det,)
+
+    eps = 1e-12
+    ppds_max = float(torch.nan_to_num(PPDS, nan=0.0, posinf=0.0, neginf=0.0).max().item())
+    PPDS_maxnorm = PPDS / max(ppds_max, eps)
+    PPDS_relative = PPDS / (SENS + eps)
+
+    def _plot_single(img: torch.Tensor, title: str, fname: str):
+        fig, ax = plt.subplots(figsize=(7.2, 6.6), layout="constrained")
+        im = ax.imshow(img.T.cpu().numpy(), extent=extent, origin="lower", cmap=cmap)
+        if overlay_geometry:
+            # Create NEW PolyCollections per figure to avoid the "single artist" error.
+            pc_plate = _polycollection_from_vertices(
+                plate_vertices, facecolor="none", edgecolor="tab:red", linewidth=0.6, alpha=0.8
+            )
+            pc_det = _polycollection_from_vertices(
+                det_vertices, facecolor="none", edgecolor="white", linewidth=0.4, alpha=0.7
+            )
+            if pc_plate: ax.add_collection(pc_plate)
+            if pc_det:   ax.add_collection(pc_det)
+
+        cbar = fig.colorbar(im, ax=ax)
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Y (mm)")
+        ax.set_title(title)
+        out_path = os.path.join(plot_dir, fname)
+        fig.savefig(out_path, dpi=250)
+        plt.close(fig)
+        return out_path
+
+    paths = []
+    paths.append(_plot_single(PPDS,           f"PPDS map (layout {layout_idx:03d})",
+                              f"ppds_map_layout_{layout_idx:03d}.png"))
+    paths.append(_plot_single(PPDS_maxnorm,   f"PPDS (max-normalized) (layout {layout_idx:03d})",
+                              f"ppds_maxnorm_layout_{layout_idx:03d}.png"))
+    paths.append(_plot_single(PPDS_relative,  f"PPDS / SENS (relative) (layout {layout_idx:03d})",
+                              f"ppds_relative_layout_{layout_idx:03d}.png"))
+
+    # quick text summary of V_i
+    nz = V_i[V_i > 0]
+    summary = os.path.join(plot_dir, f"ppds_summary_layout_{layout_idx:03d}.txt")
+    with open(summary, "w") as f:
+        f.write(f"Layout {layout_idx:03d}\n")
+        f.write(f"PPDS max      : {ppds_max:.6g}\n")
+        f.write(f"Nonzero V_i   : {int(nz.numel())} / {V_i.numel()}\n")
+        if nz.numel():
+            f.write(f"V_i mean/median(min,max): "
+                    f"{float(nz.mean()):.6g} / {float(nz.median()):.6g} "
+                    f"({float(nz.min()):.6g}, {float(nz.max()):.6g})\n")
+
+    print("Saved:")
+    for p in paths: print("  ", p)
+    print("  ", summary)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python arg_plot_ppds_maps.py <layout_idx>")
+        sys.exit(1)
+    try:
+        layout_idx = int(sys.argv[1])
+    except ValueError:
+        print("Error: <layout_idx> must be an integer."); sys.exit(1)
+
+    # Paths consistent with your pipeline — edit if your names differ
+    SCANNER_LAYOUTS_DIR  = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon"
+    SCANNER_LAYOUTS_FILE = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/4mm_config/scanner_layouts_656e127ba3bd9d457db00df0101ed0bd_rot20_trans1x1_step0x0.tensor"
+    PPDS_DIR             = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs_4mm_aperture"
+    PLOT_DIR             = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/metrics_4mm_aperture"
+
+    print(f"--- [START] Step 1: Plotting PPDS for layout {layout_idx} ---")
+    plot_ppds_maps(
+        layout_idx,
+        SCANNER_LAYOUTS_DIR,
+        SCANNER_LAYOUTS_FILE,
+        PPDS_DIR,
+        PLOT_DIR,
+        cmap="viridis",
+        overlay_geometry=True,
+    )
+    print(f"--- [ END ] Step 2: Plotted PPDS for layout {layout_idx} ---")
+'''
+
+#!/usr/bin/env python3
+import os, sys, h5py, torch, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
+
+from geometry_2d_io import load_scanner_layout_geometries, load_scanner_layouts
+from geometry_2d_utils import fov_tensor_dict
+
+def _polycollection_from_vertices(vertices: torch.Tensor, **kwargs):
+    if vertices is None or vertices.numel() == 0:
+        return None
+    return PolyCollection(vertices.cpu().tolist(), **kwargs)
+
+def plot_ppds_maps(
+    layout_selector,                  # int layout index OR string 'AVG'
+    scanner_layouts_dir: str,
+    scanner_layouts_filename: str,
+    ppds_dir: str,
+    plot_dir: str,
+    cmap: str = "viridis",
+    overlay_geometry: bool = True,
+):
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # FOV info
+    fov = fov_tensor_dict(n_pixels=(280, 280), mm_per_pixel=(0.25, 0.25), center_coordinates=(0.0, 0.0))
+    width_mm  = float(fov["size in mm"][0].item())
+    height_mm = float(fov["size in mm"][1].item())
+    extent = (-width_mm/2, width_mm/2, -height_mm/2, height_mm/2)
+
+    # Geometry overlay: for AVG we just show layout 0 as a reference (or you can set overlay_geometry=False)
+    layouts_data, _ = load_scanner_layouts(scanner_layouts_dir, scanner_layouts_filename)
+    if isinstance(layout_selector, str) and layout_selector.upper() == "AVG":
+        overlay_idx = 0
+        plate_vertices, det_vertices = load_scanner_layout_geometries(overlay_idx, layouts_data)
+        ppds_h5 = os.path.join(ppds_dir, f"ppds_layout_AVG.hdf5")
+        nice_tag = "AVG"
+    else:
+        layout_idx = int(layout_selector)
+        plate_vertices, det_vertices = load_scanner_layout_geometries(layout_idx, layouts_data)
+        ppds_h5 = os.path.join(ppds_dir, f"ppds_layout_{layout_idx:03d}.hdf5")
+        nice_tag = f"{layout_idx:03d}"
+
+    if not os.path.exists(ppds_h5):
+        raise FileNotFoundError(f"Missing {ppds_h5}. Generate it with arg_compute_ppds.py first.")
+
+    with h5py.File(ppds_h5, "r") as f:
+        PPDS = torch.from_numpy(f["PPDS"][...]).to(torch.float64)   # (H,W)
+        SENS = torch.from_numpy(f["SENS"][...]).to(torch.float64)
+        # V_i likely absent for AVG; handle gracefully
+        V_i  = torch.from_numpy(f["V_i"][...]) if "V_i" in f else None
+
+    eps = 1e-12
+    PPDS_nz   = torch.nan_to_num(PPDS, nan=0.0, posinf=0.0, neginf=0.0)
+    ppds_max  = float(PPDS_nz.max().item())
+    PPDS_maxnorm  = PPDS / max(ppds_max, eps)
+    PPDS_relative = PPDS / (SENS + eps)
+
+    def _plot_single(img: torch.Tensor, title: str, fname: str):
+        fig, ax = plt.subplots(figsize=(7.2, 6.6), layout="constrained")
+        im = ax.imshow(img.T.cpu().numpy(), extent=extent, origin="lower", cmap=cmap)
+        if overlay_geometry:
+            pc_plate = _polycollection_from_vertices(
+                plate_vertices, facecolor="none", edgecolor="tab:red", linewidth=0.6, alpha=0.8
+            )
+            pc_det = _polycollection_from_vertices(
+                det_vertices, facecolor="none", edgecolor="white", linewidth=0.4, alpha=0.7
+            )
+            if pc_plate: ax.add_collection(pc_plate)
+            if pc_det:   ax.add_collection(pc_det)
+
+        fig.colorbar(im, ax=ax)
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Y (mm)")
+        ax.set_title(title)
+        out_path = os.path.join(plot_dir, fname)
+        fig.savefig(out_path, dpi=250)
+        plt.close(fig)
+        return out_path
+
+    paths = []
+    paths.append(_plot_single(PPDS,          f"PPDS map (layout {nice_tag})",
+                              f"ppds_map_layout_{nice_tag}.png"))
+    paths.append(_plot_single(PPDS_maxnorm,  f"PPDS (max-normalized) (layout {nice_tag})",
+                              f"ppds_maxnorm_layout_{nice_tag}.png"))
+    paths.append(_plot_single(PPDS_relative, f"PPDS / SENS (relative) (layout {nice_tag})",
+                              f"ppds_relative_layout_{nice_tag}.png"))
+
+    summary = os.path.join(plot_dir, f"ppds_summary_layout_{nice_tag}.txt")
+    with open(summary, "w") as f:
+        f.write(f"Layout {nice_tag}\n")
+        f.write(f"PPDS max      : {ppds_max:.6g}\n")
+        if V_i is not None:
+            nz = V_i[V_i > 0]
+            f.write(f"Nonzero V_i   : {int(nz.numel())} / {V_i.numel()}\n")
+            if nz.numel():
+                f.write(f"V_i mean/median(min,max): "
+                        f"{float(nz.mean()):.6g} / {float(nz.median()):.6g} "
+                        f"({float(nz.min()):.6g}, {float(nz.max()):.6g})\n")
+        else:
+            f.write("V_i           : (not present for AVG map)\n")
+
+    print("Saved:")
+    for p in paths: print("  ", p)
+    print("  ", summary)
+
+if __name__ == "__main__":
+    # Usage:
+    #   python arg_plot_ppds_maps.py <layout_idx>
+    #   python arg_plot_ppds_maps.py avg
+    if len(sys.argv) != 2:
+        print("Usage: python arg_plot_ppds_maps.py <layout_idx|avg>")
+        sys.exit(1)
+
+    selector = sys.argv[1]
+    try:
+        # accept int or 'avg'
+        layout_selector = int(selector)
+    except ValueError:
+        if selector.lower() in ("avg", "average", "mean"):
+            layout_selector = "AVG"
+        else:
+            print("Error: layout_idx must be an integer or 'avg'.")
+            sys.exit(1)
+
+    SCANNER_LAYOUTS_DIR  = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon"
+    SCANNER_LAYOUTS_FILE = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/3mm_config/scanner_layouts_636bed318120192d3b39fb33a7655ea8_rot20_trans1x1_step0x0.tensor"
+    PPDS_DIR             = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs"
+    PLOT_DIR             = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/metrics"
+
+    print(f"--- [START] Step 1: Plotting PPDS for layout {selector} ---")
+    plot_ppds_maps(
+        layout_selector,
+        SCANNER_LAYOUTS_DIR,
+        SCANNER_LAYOUTS_FILE,
+        PPDS_DIR,
+        PLOT_DIR,
+        cmap="viridis",
+        overlay_geometry=True,
+    )
+    print(f"--- [ END ] Step 2: Plotted PPDS for layout {selector} ---")
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/arg_plot_ppds_maps.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/asci_map_comparision.py =====
+import h5py
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+def find_asci_histogram_overlap_and_plot(
+    file_path_A: str,
+    file_path_B: str,
+    output_dir: str = "./",
+    output_filename_h5: str = "overlap_mask.hdf5",
+    output_filename_plot: str = "overlap_visualization.png",
+    dataset_name: str = "asci_histogram",
+    overlap_dataset_name: str = "intersection_mask"
+) -> None:
+    """
+    Loads two ASCI histogram HDF5 files, computes the intersection of
+    their non-zero regions, saves the boolean mask, and plots the results.
+    """
+
+    # --- 1. Load Data ---
+    print(f"Loading data from: {file_path_A}")
+    with h5py.File(file_path_A, 'r') as f:
+        map_A = f[dataset_name][:]
+    
+    print(f"Loading data from: {file_path_B}")
+    with h5py.File(file_path_B, 'r') as f:
+        map_B = f[dataset_name][:]
+
+    if map_A.shape != map_B.shape:
+        raise ValueError(
+            f"HDF5 datasets must have the same shape for comparison. "
+            f"Map A shape: {map_A.shape}, Map B shape: {map_B.shape}"
+        )
+    
+    # --- 2. Find Overlap (Boolean AND) ---
+    print("Computing non-zero region overlap...")
+
+    mask_A = map_A > 0
+    mask_B = map_B > 0
+    intersection_mask = mask_A & mask_B
+    
+    # --- 3. Create Masked Maps ---
+    masked_map_A = map_A.copy()
+    masked_map_B = map_B.copy()
+    masked_map_A[~intersection_mask] = 0
+    masked_map_B[~intersection_mask] = 0
+
+    # --- 4. Save Mask and Data (HDF5) ---
+    os.makedirs(output_dir, exist_ok=True)
+    output_path_h5 = os.path.join(output_dir, output_filename_h5)
+
+    print(f"Saving intersection mask and masked data to: {output_path_h5}")
+    with h5py.File(output_path_h5, 'w') as f:
+        f.create_dataset(overlap_dataset_name, data=intersection_mask, dtype='bool')
+        f.create_dataset('masked_map_A', data=masked_map_A, dtype=map_A.dtype)
+        f.create_dataset('masked_map_B', data=masked_map_B, dtype=map_B.dtype)
+
+    # --- 5. Visualization (1x3 Grid) ---
+    print("Creating visualization...")
+    
+    # Determine global max for synchronized color scale
+    # Add a check in case both maps are all zero
+    vmax_A = np.max(masked_map_A)
+    vmax_B = np.max(masked_map_B)
+    global_max_value = max(vmax_A, vmax_B)
+    
+    # Prevent matplotlib error if max value is 0
+    if global_max_value == 0:
+        global_max_value = 1 
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+    
+    # --- Plot 1: Overlap Mask ---
+    # 👇 MODIFICATION: Added aspect='auto'
+    axes[0].imshow(intersection_mask, cmap='gray', aspect='auto')
+    axes[0].set_title("1. Overlap Mask (Non-Zero in Both)")
+    axes[0].set_xlabel("Angle Bin")
+    axes[0].set_ylabel("Pixel Index")
+    # This text line is already fixed (no $ chars)
+    axes[0].text(0.5, -0.15, 'Boolean AND', 
+                 transform=axes[0].transAxes, ha='center', fontsize=10)
+    
+    # --- Plot 2 & 3: Masked Magnitudes (Synchronized Scale) ---
+    
+    # Image 2: Values of Map A in the overlap region
+    # 👇 MODIFICATION: Added aspect='auto'
+    im2 = axes[1].imshow(masked_map_A, cmap='viridis', vmin=0, vmax=global_max_value, aspect='auto')
+    axes[1].set_title(f"2. Values of {os.path.basename(file_path_A)}")
+    axes[1].set_xlabel("Angle Bin")
+    axes[1].set_ylabel("Pixel Index")
+
+    # Image 3: Values of Map B in the overlap region
+    # 👇 MODIFICATION: Added aspect='auto'
+    im3 = axes[2].imshow(masked_map_B, cmap='viridis', vmin=0, vmax=global_max_value, aspect='auto')
+    axes[2].set_title(f"3. Values of {os.path.basename(file_path_B)}")
+    axes[2].set_xlabel("Angle Bin")
+    axes[2].set_ylabel("Pixel Index")
+    
+    # Add a single color bar for both Image 2 and 3
+    cbar = fig.colorbar(im3, ax=axes[1:], orientation='vertical', fraction=0.046, pad=0.04)
+    cbar.set_label('Histogram Count (Synchronized Scale)')
+    
+    # Save the figure
+    output_path_plot = os.path.join(output_dir, output_filename_plot)
+    plt.savefig(output_path_plot, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Visualization saved to: {output_path_plot}")
+
+    # --- 6. Report Summary (Optional) ---
+    total_pixels = map_A.size
+    overlap_count = np.sum(intersection_mask)
+    overlap_percent = (overlap_count / total_pixels) * 100
+    
+    print("\n--- Summary ---")
+    print(f"Total entries (pixels x angle bins): {total_pixels}")
+    print(f"Non-zero entries in Map A: {np.sum(mask_A)}")
+    print(f"Non-zero entries in Map B: {np.sum(mask_B)}")
+    print(f"Overlapping (non-zero in both) entries: {overlap_count}")
+    print(f"Overlap represents: {overlap_percent:.4f}% of the total map size.")
+    print("-----------------")
+
+
+if __name__ == '__main__':
+    # --- USER CONFIGURATION ---
+    DATA_DIR = '../../../data/sc_mph_36det_3mm_base_layout_rotated_10custom_rot/filtered_outputs/'
+    
+    # These paths look correct based on your last message
+    FILE_A = DATA_DIR + 'mpxi_1/asci_histogram_00.hdf5' 
+    FILE_B = DATA_DIR + 'mpxi_2/asci_histogram_00.hdf5' 
+    
+    OUTPUT_FOLDER = '../../../data/sc_mph_36det_3mm_base_layout_rotated_10custom_rot/intersection_results'
+    OUTPUT_H5_FILE = 'M2_AND_M3_overlap.hdf5'
+    OUTPUT_PLOT_FILE = 'M2_AND_M3_overlap_plot.png'
+    # --------------------------
+
+    try:
+        find_asci_histogram_overlap_and_plot(
+            file_path_A=FILE_A,
+            file_path_B=FILE_B,
+            output_dir=OUTPUT_FOLDER,
+            output_filename_h5=OUTPUT_H5_FILE,
+            output_filename_plot=OUTPUT_PLOT_FILE,
+            dataset_name='asci_histogram'
+        )
+    except FileNotFoundError as e:
+        print(f"\nERROR: Could not find an input file. Please check your file paths.")
+        print(e)
+    except ValueError as e:
+        print(f"\nERROR: Data shape mismatch.")
+        print(e)
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/asci_map_comparision.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/asci_plot_generation.py =====
+import os, h5py, torch, matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+# -------------------------------------------------------------------
+INPUT_DIR  = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/outputs_3mm_aperture_displaced_24ph"
+PLOT_DIR   = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/metrics/metrics_3mm_aperture_displaced_24ph"
+LAYOUT_SEQ = range(15)            # range(24) after you have all histograms
+N_BINS     = 360
+FOV_SIDE   = 10                  # mm  (±16 mm)
+# -------------------------------------------------------------------
+
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+asci_hist = torch.zeros(280*280, N_BINS, dtype=torch.int32)
+
+for idx in LAYOUT_SEQ:
+    with h5py.File(os.path.join(INPUT_DIR,
+                                f"asci_histogram_{idx:03d}.hdf5"), "r") as f:
+        asci_hist += torch.from_numpy(f["asci_histogram"][...])
+
+asci_map = torch.count_nonzero(asci_hist, dim=1) / N_BINS   # 0‒1
+
+# ---- plot -----------------------------------------------------------
+fig, ax = plt.subplots(figsize=(8,7), layout="constrained")
+
+im = ax.imshow(asci_map.view(280,280).T,
+               extent=(-FOV_SIDE/2, FOV_SIDE/2, -FOV_SIDE/2, FOV_SIDE/2),
+               origin="lower", cmap="viridis")
+cbar = fig.colorbar(im, ax=ax, label="ASCI")
+cbar.formatter = PercentFormatter(xmax=1.0, decimals=1); cbar.update_ticks()
+
+ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
+ax.set_title(f"max {asci_map.max():.2%}, min {asci_map.min():.2%}")
+
+fig.savefig(os.path.join(PLOT_DIR, "asci_map.png"), dpi=300)
+plt.close(fig)
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/asci_plot_generation.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/beam_property_extract.py =====
+from typing import Dict
+
+from torch import Tensor, arange, argwhere, atan2, cat, cos, diff
+from torch import empty as empty_tensor, uint16 as uint16_tensor
+from torch import (
+    float32,
+    gradient,
+    linspace,
+    logical_and,
+    meshgrid,
+    norm,
+    pi,
+    sin,
+    stack,
+    tensor,
+    where,
+    zeros,
+    zeros_like,
+)
+from torch.nn import functional as F
+
+from geometry_2d_utils import local_max_1d
+
+
+def get_arc_nodes_2d(
+    convex_hull: Tensor,
+    crystal_center: Tensor,
+):
+    """
+    Get the arc nodes for the spiral sampling.
+    The second node controls the curvature of the spiral.
+    """
+
+    # find the closest point in the convex hull (excluding the crystal center) to the center of the crystal
+
+    distances = norm(convex_hull - crystal_center, dim=1)
+    indices = distances.argsort()
+    nodes = convex_hull[indices][1:3]
+
+    rads = atan2(
+        nodes[:, 1] - crystal_center[1],
+        nodes[:, 0] - crystal_center[0],
+    )
+    rads = rads + 2 * pi * (rads < 0)
+    distances = distances[indices][1:3]
+    return stack([distances, rads], dim=1)
+
+
+def get_sampling_arc_coordinates_2d(nodes, n=100):
+    """Get spiral sampling coordinates in 2D."""
+    ends = nodes[nodes[:, 1].argsort()]
+    if ends[1, 1] - ends[0, 1] > pi:
+        ends[1, 1] = ends[1, 1] - 2 * pi
+        angles = linspace(ends[1, 1], ends[0, 1], n)
+        radius = linspace(ends[1, 0], ends[0, 0], n)
+    else:
+        angles = linspace(ends[0, 1], ends[1, 1], n)
+        radius = linspace(ends[0, 0], ends[1, 0], n)
+    x = radius * cos(angles)
+    y = radius * sin(angles)
+    return stack((x, y), dim=-1), angles
+
+
+def sample_ppdf_on_arc_2d_local(
+    ppdf_data_2d: Tensor,
+    detector_center: Tensor,
+    hull_2d: Tensor,
+    fov_dict: dict,
+    n_samples: int = 1024,
+):
+    arc_nodes = get_arc_nodes_2d(
+        hull_2d,
+        detector_center,
+    )
+    # Get the sampling points and angles
+    sampling_points, sampling_rads = get_sampling_arc_coordinates_2d(
+        arc_nodes,
+        n=n_samples,
+    )
+    sampling_points = sampling_points + detector_center
+
+    # Prepare the input and grid for sampling
+
+    # 2D PPDF field
+    ppdf_field = ppdf_data_2d.T.view(
+        1, 1, int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1])
+    ).to(float32)
+
+    # The grid contains the coordinates of the points where the input scalar
+    # field is sampled. The grid is in the range [-1, 1] for both x and y.
+
+    grid = (
+        sampling_points.unsqueeze(0).unsqueeze(0).to(float32)
+        / fov_dict["size in mm"]
+        * 2
+    )
+
+    sampled_ppdf = F.grid_sample(
+        ppdf_field, grid, mode="bilinear", align_corners=True
+    ).squeeze()
+    return sampled_ppdf, sampling_rads, sampling_points
+
+
+def get_beams_angle_radian(
+    beams_centers: Tensor,
+    reference_point: Tensor,
+) -> Tensor:
+    n_beams = beams_centers.shape[0]
+    reference_point_expanded = reference_point.unsqueeze(0).expand(n_beams, -1)
+    angles = atan2(
+        reference_point_expanded[:, 1] - beams_centers[:, 1],
+        reference_point_expanded[:, 0] - beams_centers[:, 0],
+    )
+    angles = angles + 2 * pi * (angles < 0).float()
+    return angles
+
+
+def get_beams_weighted_center(
+    beams_masks: Tensor,
+    pixels_xys: Tensor,
+    ppdf_data: Tensor,
+) -> Tensor:
+    """
+    Compute the weighted center of the beams based on the pixel data and beam masks.
+
+    Parameters
+    ----------
+    beam_masks: Tensor
+      - The masks for the beams.
+      - `shape`: (n_pixels, n_beams)
+      - `dtype`: `bool`
+
+
+    pixels_xys: Tensor
+      The field of view points.
+
+    ppdf_data: Tensor
+      The pixel data probability distribution function.
+
+    beams_relative_sensitivities: Tensor
+      The means of the beams.
+    """
+    n_beams = beams_masks.shape[0]
+    pixels_xys_expanded = pixels_xys.unsqueeze(0).expand(n_beams, -1, -1)
+    ppdf_expanded = (
+        ppdf_data.view(-1).unsqueeze(0).unsqueeze(2).expand(n_beams, -1, 2)
+    )
+
+    xy_weighted_sum = (
+        (pixels_xys_expanded * ppdf_expanded)
+        .masked_fill_(~beams_masks.unsqueeze(2).expand(-1, -1, 2), 0)
+        .sum(dim=1)
+    )
+    total_weights = (
+        (ppdf_data.view(-1).unsqueeze(0).expand(n_beams, -1))
+        .clone()
+        .masked_fill_(~beams_masks, 0)
+        .sum(dim=1)
+    )
+    return xy_weighted_sum / total_weights.unsqueeze(1)
+
+
+def full_width_half_maximum_1d_batch(
+    data_x_batch: Tensor,
+    data_y_batch: Tensor,
+):
+    """
+    Calculate the full width at half maximum (FWHM) for each curve in the batch.
+    The FWHM is defined as the distance between the two points where the curve
+    crosses half of the maximum value.
+
+    The function returns the x-coordinates of the two points and the FWHM value.
+
+    Parameters
+    ----------
+
+    data_x_batch: Tensor
+      The x-coordinates of the data points.
+      `shape`: (n_batch, n_points)
+      `dtype`: `float32`
+
+    data_y_batch: Tensor
+      The y-coordinates of the data points.
+      `shape`: (n_batch, n_points)
+      `dtype`: `float32`
+
+    Returns
+    ----------
+
+    fwhm_batch: Tensor
+      The FWHM values for each curve in the batch.
+      `shape`: (n_batch,)
+      `dtype`: `float32`
+
+    x_bounds_batch: Tensor
+        The x-coordinates of the two points where the curve crosses half of the maximum.
+        `shape`: (n_batch, 2)
+        `dtype`: `float32`
+    """
+
+    n_batch = data_x_batch.shape[0]
+    n_points = data_x_batch.shape[1]
+
+    # Find the indices of the points where the curve crosses half of the maximum
+    half_max = (
+        (data_y_batch.max(dim=1).values * 0.5).unsqueeze(1).expand(-1, n_points)
+    )
+    x_above_half_max_batch = (
+        where(data_y_batch >= half_max, data_x_batch, 0).sort(dim=1).values
+    )
+    x_upper_lower_batch = x_above_half_max_batch[:, [0, -1]]
+    fwhm_batch = x_upper_lower_batch[:, 1] - x_upper_lower_batch[:, 0]
+    return fwhm_batch, x_upper_lower_batch
+
+
+def beam_sampling_line_batch(
+    detector_unit_center: Tensor,
+    beam_center_batch: Tensor,
+    n_samples: int = 1024,
+    length: float = 32.0,
+):
+    """
+    Get the sampling line for the beams in batch.
+    The sampling line is perpendicular to the beam axis and passes through the
+    beam center.
+
+    Parameters
+    ----------
+
+    detector_unit_center: Tensor
+      The center of the detector unit.
+      `shape`: (2,)
+      `dtype`: `float32`
+
+    beam_center_batch: Tensor
+      The weighted centers of the beams.
+      `shape`: (n_beams, 2)
+      `dtype`: `float32`
+
+    n_samples: int
+      The number of samples to take along the sampling line.
+
+    length: float
+      The length of the sampling line.
+
+    Returns
+    -------
+    sampling_points_batch: Tensor
+      The sampling points along the sampling line.
+      `shape`: (n_beams, n_samples, 2)
+      `dtype`: `float32`
+
+    sampling_distance: Tensor
+      The distances along the sampling line.
+      `shape`: (n_samples,)
+      `dtype`: `float32`
+    """
+    n_beams = beam_center_batch.shape[0]
+    beam_axis_rad = atan2(
+        beam_center_batch[:, 1] - detector_unit_center[1],
+        beam_center_batch[:, 0] - detector_unit_center[0],
+    )
+    beam_axis_rad = beam_axis_rad + 2 * pi * (beam_axis_rad < 0)
+    sampling_line_rad = beam_axis_rad + pi * 0.5
+    kx = cos(sampling_line_rad)
+    ky = sin(sampling_line_rad)
+    sampling_distance = linspace(-length / 2, length / 2, n_samples)
+    sampling_points_batch = stack((kx, ky), dim=1).unsqueeze(1).expand(
+        -1, n_samples, -1
+    ) * sampling_distance.view(1, n_samples, 1).expand(
+        n_beams, -1, 2
+    ) + beam_center_batch.unsqueeze(
+        1
+    ).expand(
+        -1, n_samples, -1
+    )
+    return sampling_points_batch, sampling_distance
+
+
+def beam_samples_on_points_batch(
+    beam_data_2d_batch: Tensor,
+    beam_sampling_points_batch: Tensor,
+    fov_dict: dict,
+):
+    """
+    Sample the beams data on the sampling points in batch.
+
+    Parameters
+    ----------
+    beam_data_2d_batch: Tensor
+      The PPDFs data in 2D.
+      `shape`: (n_beams, n_pixels_x, n_pixels_y)
+      `dtype`: `float32`
+
+    beam_sampling_points_batch: Tensor
+        The sampling points for the beams.
+        `shape`: (n_beams, n_samples, 2)
+        `dtype`: `float32`
+
+    fov_dict: Dict, (optional)
+        The field of view dictionary.
+        `shape`: (n_pixels_x, n_pixels_y)
+        `dtype`: `float32`
+
+    n_samples: int
+        The number of samples to take along the sampling line.
+
+    Returns
+    -------
+    sampled_beams_batch: Tensor
+      The sampled beams data.
+      `shape`: (n_beams, n_samples)
+      `dtype`: `float32`
+    """
+    # Prepare the input and grid for sampling
+    # 2D PPDF field
+
+    beam_field = beam_data_2d_batch.view(
+        beam_data_2d_batch.shape[0],
+        1,
+        beam_data_2d_batch.shape[1],
+        beam_data_2d_batch.shape[2],
+    ).swapaxes(
+        -1, -2
+    )  # (n_beams, 1, n_pixels_x, n_pixels_y)
+
+    # The grid contains the coordinates of the points where the input scalar
+    # field is sampled. The grid is in the range [-1, 1] for both x and y.
+
+    grid = (
+        beam_sampling_points_batch.unsqueeze(1) / fov_dict["size in mm"] * 2
+    )  # (n_beams, 1, n_samples, 2)
+
+    sampled_beams_batch = F.grid_sample(
+        beam_field, grid, mode="bilinear", align_corners=True
+    ).squeeze((1,2))
+    return sampled_beams_batch
+
+
+def angular_edges_on_arc(
+    sampled_data: Tensor,
+    sampling_rads: Tensor,
+    threshold: float = 0.01,
+) -> Tensor:
+
+    relative_sampled_ppdf = sampled_data / sampled_data.max()
+    threshold = 0.01
+    thresholded_relative_sampled_ppdf = zeros_like(
+        relative_sampled_ppdf
+    ).masked_fill_(relative_sampled_ppdf > threshold, 1)
+
+    forward_diff_abs = diff(
+        thresholded_relative_sampled_ppdf, prepend=tensor([0.0])
+    ).abs()
+    radian_edges = sampling_rads[forward_diff_abs > 0.5]
+    return radian_edges
+
+
+def beams_boundaries_radians(
+    arc_sampled_ppdf: Tensor, arc_rads: Tensor, threshold: float = 0.01
+) -> Tensor:
+    # Guard 0-signal arcs to avoid 0/0 and NaNs
+    maxv = arc_sampled_ppdf.max()
+    if maxv <= 0:
+        return arc_rads.new_zeros((0, 2))
+
+    arc_rads_step = arc_rads[1] - arc_rads[0]
+    n_samples = arc_rads.shape[0]
+
+    ABSOLUTE_INTENSITY_FLOOR = 1.0e-6 
+    appended_rads = cat((arc_rads, arc_rads[-1:] + arc_rads_step), dim=0)
+
+    relative_sampled_ppdf = arc_sampled_ppdf / maxv
+    thresholded = zeros_like(relative_sampled_ppdf).masked_fill_(relative_sampled_ppdf > threshold, 1)
+
+    forward_diff_abs = diff(thresholded, prepend=tensor([0.0]), append=tensor([0.0])).abs()
+
+    # Avoid 0-D with flatten instead of squeeze
+    radian_edges_indices = argwhere(forward_diff_abs > 0.5).flatten()
+
+    # Need at least two edges to form one interval
+    if radian_edges_indices.numel() < 2:
+        return arc_rads.new_zeros((0, 2))
+
+    # Build intervals
+    n_intervals = int(radian_edges_indices.numel()) - 1
+    indices_expanded = arange(n_samples).view(1, -1).expand(n_intervals, -1)
+    interval_boundaries = stack((radian_edges_indices[:-1], radian_edges_indices[1:]), dim=1)
+    interval_boundaries_expanded = interval_boundaries.unsqueeze(1).expand(-1, n_samples, -1)
+
+    interval_masks = logical_and(
+        indices_expanded >= interval_boundaries_expanded[:, :, 0],
+        indices_expanded <  interval_boundaries_expanded[:, :, 1],
+    )
+
+    # Guard degenerate intervals
+    valid_counts = interval_masks.sum(dim=1)
+    if (valid_counts == 0).any():
+        keep = valid_counts > 0
+        if keep.sum() == 0:
+            return arc_rads.new_zeros((0, 2))
+        interval_masks = interval_masks[keep]
+        interval_boundaries = interval_boundaries[keep]
+
+    # Means (shapes now agree)
+    rel_means = (
+        relative_sampled_ppdf.unsqueeze(0).expand(interval_masks.shape[0], -1)
+        .clone().masked_fill_(~interval_masks, 0).sum(dim=1) / interval_masks.sum(dim=1)
+    )
+    abs_means = (
+        arc_sampled_ppdf.unsqueeze(0).expand(interval_masks.shape[0], -1)
+        .clone().masked_fill_(~interval_masks, 0).sum(dim=1) / interval_masks.sum(dim=1)
+    )
+
+    is_valid_beam = (rel_means > threshold) & (abs_means > ABSOLUTE_INTENSITY_FLOOR)
+    if not is_valid_beam.any():
+        return arc_rads.new_zeros((0, 2))
+
+    beams_boundaries_indices = interval_boundaries[is_valid_beam]
+    beams_boundaries_angles = appended_rads[beams_boundaries_indices]
+    return beams_boundaries_angles
+
+
+
+def get_beams_masks(
+    pixels_rads: Tensor,
+    beam_bounds: Tensor,
+) -> Tensor:
+    n_beams = beam_bounds.shape[0]
+    pixels_rads_expanded = pixels_rads.unsqueeze(0).expand(n_beams, -1)
+    # Get beams masks
+    return logical_and(
+        pixels_rads_expanded >= beam_bounds[:, 0].view(-1, 1),
+        pixels_rads_expanded < beam_bounds[:, 1].view(-1, 1),
+    )
+
+
+def get_beams_combined_mask(
+    beams_masks: Tensor,
+) -> Tensor:
+    """
+    Get the combined mask for the beams.
+    The combined mask is uint16 tensor with the same shape as the beams masks.
+    The value of the combined mask is the beam id.
+    """
+    n_beams = beams_masks.shape[0]
+    beams_masks_valued = (
+        arange(1, n_beams + 1).view(-1, 1).expand(-1, beams_masks.shape[1])
+    )
+    return (
+        beams_masks_valued.clone()
+        .masked_fill_(~beams_masks, 0)
+        .to(dtype=uint16_tensor)
+    ).sum(dim=0).unsqueeze(0)
+
+
+def beams_line_properties(
+    beams_basic_properties: Dict[str, Tensor],
+    detector_unit_center: Tensor,
+    ppdf_2d: Tensor,
+    fov_dict: Dict,
+    line_n_samples: int = 4096,
+):
+    # Get the beam sampling lines
+    (beam_sp_ptx_batch, beam_sp_distance) = beam_sampling_line_batch(
+        detector_unit_center,
+        beams_basic_properties["weighted centers"],
+        n_samples=line_n_samples,
+        length=64.0,
+    )
+
+    n_beams = int(beams_basic_properties["number of beams"].item())
+    beams_masks = beams_basic_properties["masks"]
+
+    beams_data_2d_batch = (
+        ppdf_2d.view(-1)
+        .unsqueeze(0)
+        .expand(n_beams, -1)
+        .clone()
+        .masked_fill_(~beams_masks, 0)
+    ).view(
+        n_beams,
+        int(fov_dict["n pixels"][0]),
+        int(fov_dict["n pixels"][1]),
+    )
+
+    sampled_beams_batch = beam_samples_on_points_batch(
+        beams_data_2d_batch, beam_sp_ptx_batch, fov_dict
+    )
+    fwhm_batch, x_bounds_batch = full_width_half_maximum_1d_batch(
+        beam_sp_distance.view(1, -1).expand(-1, line_n_samples),
+        sampled_beams_batch,
+    )
+    return {
+        "masks": beams_masks,
+        "fwhm": fwhm_batch,
+        "fwhm distance bounds": x_bounds_batch,
+        "number of beams": tensor([n_beams]),
+        "sampling points": beam_sp_ptx_batch,
+        "sampling distance": beam_sp_distance,
+        "sampled data": sampled_beams_batch,
+    }
+
+
+def get_beams_basic_properties(
+    beams_masks: Tensor,
+    ppdf_2d: Tensor,
+    pixels_xys: Tensor,
+):
+    n_beams = beams_masks.shape[0]
+    relative_ppdf = ppdf_2d / ppdf_2d.max()
+    n_fov_points = pixels_xys.shape[0]
+    # Calculate the relative sensitivity of each beam
+    relative_ppdf_expanded = (
+        relative_ppdf.view(-1).unsqueeze(0).expand(n_beams, -1)
+    )
+    # Calculate the relative sensitivity of each beam
+    relative_sensitivity = relative_ppdf_expanded.clone().masked_fill_(
+        ~beams_masks, 0
+    ).sum(dim=1) / beams_masks.sum(dim=1)
+
+    beams_sizes = beams_masks.sum(dim=1)
+
+    absolute_sensitivity = relative_sensitivity * ppdf_2d.max()
+
+    return beams_sizes, relative_sensitivity, absolute_sensitivity
+
+
+def get_beam_width(
+    beams_centers: Tensor,
+    detector_unit_center: Tensor,
+    beams_masks: Tensor,
+    ppdf_2d: Tensor,
+    fov_dict: Dict,
+    line_n_samples: int = 4096,
+):
+    """
+    Compute the Full Width at Half Maximum (FWHM) of beams and their sampled data
+    along specified sampling lines.
+
+    Parameters
+    ----------
+    beams_centers : Tensor
+        A tensor of shape `(n_beams, 2)` representing the coordinates of the beam centers.
+    detector_unit_center : Tensor
+        A tensor of shape `(2,)` representing the center of the detector unit.
+    beams_masks : Tensor
+        A boolean tensor of shape `(n_beams, n_pixels_x * n_pixels_y)` indicating
+        the valid regions for each beam.
+    ppdf_2d : Tensor
+        A 2D tensor of shape `(n_pixels_x, n_pixels_y)` representing the pixelated
+        probability density function (PPDF).
+    fov_dict : Dict
+        A dictionary containing field-of-view (FOV) metadata, including the number
+        of pixels in each dimension (`"n pixels"`).
+    line_n_samples : int, optional
+        The number of samples to take along each sampling line. Default is 4096.
+
+    Returns
+    -------
+    Tuple[Tensor, Tensor, Tensor, Tensor]
+        - `beams_fwhm` : Tensor
+            A tensor of shape `(n_beams,)` containing the Full Width at Half Maximum
+            (FWHM) for each beam.
+        - `x_bounds_batch` : Tensor
+            A tensor of shape `(n_beams, 2)` containing the x-coordinate bounds for
+            each beam's FWHM.
+        - `sampled_beams_data` : Tensor
+            A tensor of shape `(n_beams, line_n_samples)` containing the sampled beam
+            data along the sampling lines.
+        - `beam_sp_distance` : Tensor
+            A tensor of shape `(line_n_samples,)` representing the distances along
+            the sampling lines.
+    """
+
+    # Get the beam sampling lines
+    (beam_sp_ptx_batch, beam_sp_distance) = beam_sampling_line_batch(
+        detector_unit_center,
+        beams_centers,
+        n_samples=line_n_samples,
+        length=64.0,
+    )
+
+    n_beams = beams_centers.shape[0]
+
+    beams_data_2d_batch = (
+        ppdf_2d.view(-1)
+        .unsqueeze(0)
+        .expand(n_beams, -1)
+        .clone()
+        .masked_fill_(~beams_masks, 0)
+    ).view(
+        n_beams,
+        int(fov_dict["n pixels"][0]),
+        int(fov_dict["n pixels"][1]),
+    )
+
+    sampled_beams_data = beam_samples_on_points_batch(
+        beams_data_2d_batch, beam_sp_ptx_batch, fov_dict
+    )
+    beams_fwhm, x_bounds_batch = full_width_half_maximum_1d_batch(
+        beam_sp_distance.view(1, -1).expand(-1, line_n_samples),
+        sampled_beams_data,
+    )
+    return beams_fwhm, x_bounds_batch, sampled_beams_data, beam_sp_distance
+
+
+def beams_properties_2d(
+    ppdf_2d: Tensor,
+    pixels_coordinates: Tensor,
+    pixels_rads: Tensor,
+    rads_edges: Tensor,
+    detector_unit_center: Tensor,
+    fov_dict: dict,
+    threshold: float = 0.01,
+    line_n_samples: int = 4096,
+) -> Dict[str, Tensor]:
+
+    # Basic properties of the beams
+    relative_ppdf = ppdf_2d / ppdf_2d.max()
+    n_fov_points = pixels_coordinates.shape[0]
+    n_rad_intervals = rads_edges.shape[0] - 1
+    pixels_rads_expanded = pixels_rads.unsqueeze(1).expand(-1, n_rad_intervals)
+
+    rad_interval_edges = stack(
+        [
+            rads_edges[:-1],
+            rads_edges[1:],
+        ],
+        dim=1,
+    )  # (n_rad_intervals, 2)
+    rads_edges_expanded = rads_edges.unsqueeze(0).expand(n_fov_points, -1)
+
+    # Get the radian intervals masks
+    rad_interval_masks = (
+        pixels_rads_expanded >= rads_edges_expanded[:, :-1]
+    ) & (
+        pixels_rads_expanded < rads_edges_expanded[:, 1:]
+    )  # (n_fov_points, n_rad_intervals)
+
+    relative_ppdf_expanded = (
+        relative_ppdf.view(-1).unsqueeze(1).expand(-1, n_rad_intervals)
+    )
+    sum_template = relative_ppdf_expanded.clone().masked_fill_(
+        ~rad_interval_masks, 0
+    )
+    intervals_relative_sensitivities = sum_template.sum(
+        dim=0
+    ) / rad_interval_masks.sum(dim=0)
+
+    # Discard the range with mean < 0.01
+    beams_masks = rad_interval_masks[
+        :, intervals_relative_sensitivities > threshold
+    ]
+    beams_relative_sensitivities = intervals_relative_sensitivities[
+        intervals_relative_sensitivities > threshold
+    ]
+    beam_n_pixels = beams_masks.sum(dim=0)
+
+    # Get the weighted center of the beams
+    beams_weighted_centers = beams_weighted_center(
+        beams_masks,
+        pixels_coordinates,
+        relative_ppdf,
+        beams_relative_sensitivities,
+    )
+    beams_sensitivities = beams_relative_sensitivities * ppdf_2d.max()
+
+    # Calculate the beam regions radian edges
+    beam_rads_edges = rad_interval_edges[
+        intervals_relative_sensitivities > threshold
+    ]
+
+    # Get the beam sampling lines
+    (beam_sp_ptx_batch, beam_sp_distance) = beam_sampling_line_batch(
+        detector_unit_center,
+        beams_weighted_centers,
+        n_samples=line_n_samples,
+        length=64.0,
+    )
+
+    # Swap the axes of the beam masks
+    beams_masks = beams_masks.swapaxes(0, 1)
+    # Number of beams
+    n_beams = beams_masks.shape[0]
+
+    beams_data_2d_batch = (
+        ppdf_2d.view(-1)
+        .unsqueeze(0)
+        .expand(n_beams, -1)
+        .clone()
+        .masked_fill_(~beams_masks, 0)
+    ).view(
+        n_beams,
+        int(fov_dict["n pixels"][0]),
+        int(fov_dict["n pixels"][1]),
+    )
+
+    sampled_beams_batch = beam_samples_on_points_batch(
+        beams_data_2d_batch, beam_sp_ptx_batch, fov_dict
+    )
+    fwhm_batch, x_bounds_batch = full_width_half_maximum_1d_batch(
+        beam_sp_distance.view(1, -1).expand(-1, line_n_samples),
+        sampled_beams_batch,
+    )
+    # Calculate the beam axis angle in radian
+    beam_axis_rad = atan2(
+        beams_weighted_centers[:, 1] - detector_unit_center[1],
+        beams_weighted_centers[:, 0] - detector_unit_center[0],
+    )
+    beam_axis_rad = beam_axis_rad + 2 * pi * (beam_axis_rad < 0)
+    return {
+        "masks": beams_masks,
+        "weighted centers": beams_weighted_centers,
+        "rads edges": beam_rads_edges,
+        "axial angle": beam_axis_rad,
+        "sensitivities": beams_sensitivities,
+        "relative sensitivities": beams_relative_sensitivities,
+        "n pixels": beam_n_pixels,
+        "fwhm": fwhm_batch,
+        "fwhm distance bounds": x_bounds_batch,
+        "number of beams": tensor([n_beams]),
+        "sampling points": beam_sp_ptx_batch,
+        "sampling distance": beam_sp_distance,
+        "sampled data": sampled_beams_batch,
+    }
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/beam_property_extract.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/beam_property_io.py =====
+import os
+from typing import Dict, Tuple
+
+import h5py
+from numpy import array as np_array
+from torch import Tensor, arange, cat, stack, tensor
+
+
+def initialize_beam_properties_hdf5(
+    out_hdf5_filename: str,
+    out_dir: str = "./",
+) -> Tuple[
+    h5py.File,
+    h5py.Dataset,
+]:
+    """
+    Creates an HDF5 file to store beam properties.
+
+    Parameters
+    ----------
+
+    out_hdf5_filename : str
+            Unique identifier for the layouts.
+
+    out_dir : int
+            Number of pixels in the field of view.
+
+    Returns
+    -------
+
+    Tuple[h5py.File, h5py.Dataset]
+          (`HDF5 file object`, `beam properties dataset object`)
+    """
+    # Create the output directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+    # Check if the output file already exists
+    if os.path.exists(os.path.join(out_dir, out_hdf5_filename)):
+        raise FileExistsError(
+            f"Output file {out_hdf5_filename} already exists in {out_dir}."
+        )
+
+    # Create a hdf5 file to store the beams properties
+
+    out_hdf5_file = h5py.File(os.path.join(out_dir, out_hdf5_filename), "w")
+
+    beam_properties_dataset = out_hdf5_file.create_dataset(
+        "beam_properties",
+        shape=(0, 11),
+        maxshape=(
+            None,
+            11,
+        ),  # Maximum shape: (Unlimited, 11) - unlimited rows, 11 columns
+        chunks=(
+            200,
+            11,
+        ),  # Chunk shape: (100, 11) - Important for performance!
+    )
+    beam_properties_dataset.attrs["Description"] = (
+        "Beams properties for each detector unit"
+    )
+    beam_properties_dataset.attrs["Data type"] = "Float"
+    header = [
+        "scanner position id",  # 1
+        "detector unit id",  # 2
+        "beam id",  # 3
+        "Angle (rad)",  # 4
+        "FWHM (mm)",  # 5
+        "weighted center x (mm)",  # 6
+        "weighted center y (mm)",  # 7
+        "sensitivity",  # 8
+        "relative sensitivity",  # 9
+        "number of pixels",  # 10
+        "number of coexisting beams",  # 11
+    ]
+    beam_properties_dataset.attrs["Header"] = np_array(
+        header, dtype=h5py.string_dtype(encoding="utf-8")
+    )
+    return (out_hdf5_file, beam_properties_dataset)
+
+
+def initialize_beam_masks_hdf5(
+    n_pixels: int,
+    out_hdf5_filename: str,
+    out_dir: str = "./",
+) -> Tuple[h5py.File, h5py.Dataset]:
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    if os.path.exists(os.path.join(out_dir, out_hdf5_filename)):
+        raise FileExistsError(
+            f"Output file {out_hdf5_filename} already exists in {out_dir}."
+        )
+
+    out_hdf5_file = h5py.File(os.path.join(out_dir, out_hdf5_filename), "w")
+
+    beam_mask_dataset = out_hdf5_file.create_dataset(
+        "beam_mask",
+        shape=(0, n_pixels),
+        maxshape=(
+            None,
+            n_pixels,
+        ),  # Maximum shape: (Unlimited, n_pixels) - unlimited rows, n_pixels columns
+        chunks=(
+            20,
+            n_pixels,
+        ),  # Chunk shape: (100, n_pixels) -  Important for performance!
+    )
+    beam_mask_dataset.attrs["Description"] = "Beams masks for each detector unit"
+    beam_mask_dataset.attrs["Data type"] = "uint16"
+    return (out_hdf5_file, beam_mask_dataset)
+
+
+def append_to_hdf5_dataset(
+    hdf5_dataset: h5py.Dataset,
+    new_data: Tensor,
+) -> None:
+    """
+    Appends a row of data to an HDF5 dataset.
+
+    Parameters
+    ----------
+    hdf5_dataset : h5py.Dataset
+        The HDF5 dataset to which the row will be appended.
+    row_data : Tensor
+        The row data to append.
+    """
+    n_new_rows = int(new_data.shape[0])  # Get the number of new rows
+    # Resize the dataset to accommodate the new rows
+    hdf5_dataset.resize(hdf5_dataset.shape[0] + n_new_rows, axis=0)
+    # Append the new data
+    hdf5_dataset[-n_new_rows:] = new_data.numpy()
+
+
+def stack_beams_properties(
+    layout_idx: int,
+    detector_unit_idx: int,
+    angles: Tensor,
+    fwhms: Tensor,
+    sizes: Tensor,
+    relative_sensitivities: Tensor,
+    absolute_sensitivities: Tensor,
+    weighted_centers: Tensor,
+) -> Tensor:
+    """
+    Stacks the beams properties into a single tensor.
+
+    Parameters
+    ----------
+    layout_idx : int
+      The index of the layout.
+    detector_unit_idx : int
+      The index of the detector unit.
+    angles : Tensor
+      The angles of the beams.
+    fwhms : Tensor
+      The full width at half maximum (FWHM) of the beams.
+    sizes : Tensor
+      The sizes of the beams.
+    relative_sensitivities : Tensor
+      The relative sensitivity of the beams.
+    absolute_sensitivities : Tensor
+      The absolute sensitivity of the beams.
+    weighted_centers : Tensor
+      The weighted centers of the beams.
+
+    Returns
+    -------
+    Tensor
+      The stacked beams properties in the following order:
+      - `scanner position id`
+      - `detector unit id`
+      - `beam id`
+      - `Angle (rad)`
+      - `FWHM (mm)`
+      - `weighted center x (mm)`
+      - `weighted center y (mm)`
+      - `sensitivity`
+      - `relative sensitivity`
+      - `number of pixels in the beam`
+      - `number of coexisting beams`
+    """
+
+    n_beams = angles.shape[0]
+    beams_various_ids = (
+        tensor([layout_idx, detector_unit_idx], dtype=angles.dtype)
+        .unsqueeze(0)
+        .expand(n_beams, -1)
+    )
+    beams_various_ids = cat(
+        (
+            beams_various_ids,
+            arange(1, n_beams + 1).unsqueeze(1),
+        ),
+        dim=1,
+    )
+    beams_n_coexisting = tensor([[n_beams]]).expand(n_beams, -1)
+
+    stacked_beams_properties = cat(
+        (
+            beams_various_ids,
+            angles.unsqueeze(1),
+            fwhms.unsqueeze(1),
+            weighted_centers,
+            absolute_sensitivities.unsqueeze(1),
+            relative_sensitivities.unsqueeze(1),
+            sizes.unsqueeze(1),
+            beams_n_coexisting,
+        ),
+        dim=1,
+    )
+    return stacked_beams_properties
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/beam_property_io.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_beam_multiplexing.py =====
+#!/usr/bin/env python3
+"""
+check_beam_multiplexing.py
+--------------------------------
+* **Figure 1:** Histogram of *all* valid beam FWHM values (mm) with mean/median markers.
+* **Figure 2:** Bar-chart showing **how many detector units have *k* beams** (k = 1, 2, 3 …).
+* Prints the number of detectors that host at least one beam in the 2–5 mm “good-width” window.
+
+Run e.g.
+```bash
+python check_beam_multiplexing.py \
+       --props  ../../../data/scspect_4rings_biconicalmph_01pos_24pinholes_T4_protocol/outputs/beams_properties_configuration_00.hdf5 \
+       --masks  ../../../data/scspect_4rings_biconicalmph_01pos_24pinholes_T4_protocol/outputs/beams_masks_configuration_00.hdf5 \
+       --out    ../../../data/scspect_4rings_biconicalmph_01pos_24pinholes_T4_protocol/plots
+```
+"""
+import argparse, os, h5py, numpy as np, matplotlib.pyplot as plt
+import torch
+
+# ------------------------------------------------------------------ #
+
+def read_columns(h5_path: str, desired: list[str]) -> dict[str, torch.Tensor]:
+    """Return selected columns from beam_properties HDF5 as tensors."""
+    with h5py.File(h5_path, "r") as f:
+        # Handle case where header might be bytes
+        header = [h.decode('utf-8') if isinstance(h, bytes) else h for h in f["beam_properties"].attrs["Header"]]
+        data   = torch.from_numpy(f["beam_properties"][:])
+    cols: dict[str, torch.Tensor] = {}
+    for name in desired:
+        if name not in header:
+            raise RuntimeError(f"Column '{name}' not found in {h5_path}")
+        cols[name] = data[:, header.index(name)]
+    return cols
+
+# ------------------------------------------------------------------ #
+
+def main(args):
+    # -- read FWHM and detector‑ID columns ---------------------------
+    print(f"Reading properties from: {args.props}")
+    cols   = read_columns(args.props, ["FWHM (mm)", "detector unit id"])
+    fwhm_raw = cols["FWHM (mm)"].numpy()
+    det_id_raw = cols["detector unit id"].to(torch.int64)
+
+    # --- ADDED: Debugging print to show the raw data ---
+    print(f"First 10 raw FWHM values read from file: {fwhm_raw[:10]}")
+    # ----------------------------------------------------
+
+    # --- IMPORTANT: Filter out NaN values from FWHM ---
+    # This handles cases where FWHM calculation failed for a beam
+    valid_fwhm_mask = ~np.isnan(fwhm_raw)
+    fwhm = fwhm_raw[valid_fwhm_mask]
+    det_id = det_id_raw[valid_fwhm_mask]
+    
+    print(f"Read {len(fwhm_raw)} total beam entries.")
+    print(f"Found {len(fwhm)} beams with a valid FWHM value.")
+
+    # -- detectors that have at least one 2‑5 mm beam ---------------
+    if len(fwhm) > 0:
+        good_width_mask = (fwhm >= 2.0) & (fwhm <= 5.0)
+        # Apply the mask to the valid detector IDs before finding unique ones
+        n_good_det = torch.unique(det_id[good_width_mask]).numel()
+        print(f"Detectors with ≥1 beam in 2–5 mm window: {n_good_det}")
+    else:
+        print("No valid FWHM values to analyze.")
+        n_good_det = 0
+
+    # ------------------ Figure 1 – FWHM histogram ------------------
+    os.makedirs(args.out, exist_ok=True)
+    fig1, ax1 = plt.subplots(figsize=(7,4), layout="constrained")
+    
+    # Plot histogram only with valid FWHM values
+    if len(fwhm) > 0:
+        ax1.hist(fwhm, bins=200, color="#4c72b0", alpha=0.85)
+        mean_v, med_v = fwhm.mean(), np.median(fwhm)
+        ax1.axvline(mean_v, color="red",   ls="--", lw=1.5, label=f"Mean {mean_v:.2f} mm")
+        ax1.axvline(med_v,  color="green", ls=":",  lw=1.5, label=f"Median {med_v:.2f} mm")
+        ax1.legend()
+    else:
+        ax1.text(0.5, 0.5, "No valid FWHM data to plot", ha='center', va='center')
+
+    ax1.set_xlabel("Beam FWHM (mm)")
+    ax1.set_ylabel("Number of beams")
+    ax1.set_title("Distribution of Beam Widths (all valid beams)")
+    
+    out1 = os.path.join(args.out, "beam_width_histogram.png")
+    fig1.savefig(out1, dpi=300)
+    plt.close(fig1)
+    print(f"Saved → {out1}")
+
+    # ------------- Figure 2 – beams‑per‑detector bar chart ----------
+    if args.masks:
+        print(f"Reading masks from: {args.masks}")
+        with h5py.File(args.masks, "r") as f:
+            masks = torch.from_numpy(f["beam_mask"][:])
+        
+        # Count beams per detector by finding unique non-zero IDs in each mask row
+        counts = torch.tensor([(row.unique().numel() - 1) for row in masks])
+
+        # How many detectors have k beams? (k = 1…max)
+        if counts.numel() > 0 and counts.max() > 0:
+            max_k  = int(counts.max().item())
+            det_per_k = torch.bincount(counts, minlength=max_k+1)[1:]  # drop k=0 count
+            ks = np.arange(1, max_k+1)
+
+            print("\nDetectors by beam count:")
+            for k, c in zip(ks, det_per_k.tolist()):
+                print(f"  k={k}: {c} detectors")
+
+            fig2, ax2 = plt.subplots(figsize=(6,4), layout="constrained")
+            bars = ax2.bar(ks, det_per_k.numpy(), color="#55a868", alpha=0.9)
+            for bar, val in zip(bars, det_per_k.tolist()):
+                ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                         str(val), ha="center", va="bottom", fontsize=9)
+            ax2.set_xlabel("Number of beams per detector (k)")
+            ax2.set_ylabel("Number of detectors")
+            ax2.set_title("Beam Multiplicity Distribution")
+            ax2.set_xticks(ks if max_k < 10 else np.arange(1, max_k + 1, 2)) # Adjust ticks for many bars
+
+            out2 = os.path.join(args.out, "detector_beam_counts.png")
+            fig2.savefig(out2, dpi=300)
+            plt.close(fig2)
+            print(f"Saved → {out2}")
+        else:
+            print("\nNo beams found in the masks file to generate multiplicity plot.")
+    else:
+        print("\n--masks file not provided, skipping Figure 2.")
+
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Beam-width histogram and detector beam-count plot.")
+    ap.add_argument("--props", required=True, help="beam_properties_*.hdf5 file")
+    ap.add_argument("--masks", default=None, help="beams_masks_*.hdf5 file (needed for Figure 2)")
+    ap.add_argument("--out",   required=True, help="output directory for PNGs")
+    args = ap.parse_args()
+    main(args)
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_beam_multiplexing.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_cumulative_beam_widths.py =====
+#!/usr/bin/env python3
+"""
+check_cumulative_beam_widths.py
+--------------------------------
+Reads beam properties from ALL rotation files in a directory and generates a single,
+cumulative histogram of beam FWHM values.
+
+* **Figure 1:** Cumulative histogram of all valid beam FWHM values (mm) across
+    all configurations, with mean/median markers.
+* Prints the total number of beams found and the count of those within the
+    2–5 mm “good-width” window.
+
+Run e.g.
+```bash
+python check_cumulative_beam_widths.py \
+       --props-dir ../../../data/scspect_4rings_biconicalmph_01pos_24pinholes_T4_protocol/outputs/ \
+       --out       ../../../data/scspect_4rings_biconicalmph_01pos_24pinholes_T4_protocol/plots
+```
+"""
+import argparse
+import os
+import glob
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+
+# ------------------------------------------------------------------ #
+
+def read_fwhm_column(h5_path: str) -> np.ndarray:
+    """
+    Return the 'FWHM (mm)' column from a beam_properties HDF5 file.
+    
+    Args:
+        h5_path (str): Path to the HDF5 file.
+
+    Returns:
+        np.ndarray: An array containing the FWHM values.
+    """
+    with h5py.File(h5_path, "r") as f:
+        # Handle case where header might be bytes and needs decoding
+        header_raw = f["beam_properties"].attrs["Header"]
+        header = [h.decode('utf-8') if isinstance(h, bytes) else h for h in header_raw]
+        
+        if "FWHM (mm)" not in header:
+            raise RuntimeError(f"Column 'FWHM (mm)' not found in {h5_path}")
+            
+        col_index = header.index("FWHM (mm)")
+        # Use numpy directly which is sufficient for this task
+        fwhm_data = f["beam_properties"][:, col_index]
+        
+    return fwhm_data
+
+# ------------------------------------------------------------------ #
+
+def main(args):
+    """
+    Main function to find files, aggregate data, and generate the plot.
+    """
+    # -- Find all property files in the input directory -------------
+    search_pattern = os.path.join(args.props_dir, "beams_properties_*.hdf5")
+    property_files = sorted(glob.glob(search_pattern))
+
+    if not property_files:
+        print(f"Error: No 'beams_properties_*.hdf5' files found in '{args.props_dir}'")
+        return
+
+    print(f"Found {len(property_files)} beam property files to process.")
+
+    # -- Read FWHM from all files and aggregate --------------------
+    all_fwhm_values = []
+    total_beams_read = 0
+
+    for file_path in property_files:
+        print(f"  - Reading properties from: {os.path.basename(file_path)}")
+        try:
+            fwhm_raw = read_fwhm_column(file_path)
+            total_beams_read += len(fwhm_raw)
+            
+            # IMPORTANT: Filter out NaN values from FWHM for this file.
+            # This handles cases where FWHM calculation may have failed.
+            valid_fwhm_mask = ~np.isnan(fwhm_raw)
+            valid_fwhm = fwhm_raw[valid_fwhm_mask]
+            
+            all_fwhm_values.extend(valid_fwhm)
+        except Exception as e:
+            print(f"    Could not process file {os.path.basename(file_path)}: {e}")
+
+    # Consolidate into a single NumPy array for efficient analysis
+    cumulative_fwhm = np.array(all_fwhm_values)
+    
+    print("-" * 50)
+    print(f"Total beams read across all files: {total_beams_read}")
+    print(f"Found {len(cumulative_fwhm)} total beams with a valid FWHM value.")
+
+    # -- Analyze cumulative data ------------------------------------
+    if len(cumulative_fwhm) == 0:
+        print("No valid FWHM values found across all files. Cannot generate plot.")
+        return
+        
+    good_width_mask = (cumulative_fwhm >= 2.0) & (cumulative_fwhm <= 5.0)
+    n_good_beams = np.sum(good_width_mask)
+    print(f"Total beams in the 2–5 mm 'good-width' window: {n_good_beams}")
+
+    # -------------- Figure 1 – Cumulative FWHM histogram -----------
+    os.makedirs(args.out, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+    
+    # Plot the main histogram
+    ax.hist(cumulative_fwhm, bins=50, color="#4c72b0", alpha=0.9, label=f'{len(cumulative_fwhm)} total beams')
+    
+    # Calculate and plot mean/median lines for reference
+    mean_v = cumulative_fwhm.mean()
+    med_v = np.median(cumulative_fwhm)
+    max_v = np.max(cumulative_fwhm)
+    print(f"Max FWHM - {max_v}")
+    
+    ax.axvline(mean_v, color="#d62728", ls="--", lw=2, label=f"Mean: {mean_v:.2f} mm")
+    ax.axvline(med_v, color="#2ca02c", ls=":", lw=2, label=f"Median: {med_v:.2f} mm")
+    
+    # --- Final plot styling ---
+    ax.legend()
+    ax.set_xlabel("Beam FWHM (mm)")
+    ax.set_ylabel("Number of Beams")
+    ax.set_title(f"Cumulative Beam Width Distribution ({len(property_files)} Rotations)")
+    # ax.set_xlim([0,5])
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # --- Save the figure ---
+    out_path = os.path.join(args.out, "cumulative_beam_width_histogram.png")
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f"\nSaved cumulative plot → {out_path}")
+
+# ------------------------------------------------------------------ #
+
+if __name__ == "__main__":
+    # --- Argument Parsing ---
+    ap = argparse.ArgumentParser(description="Generate a cumulative beam-width histogram from multiple property files.")
+    ap.add_argument("--props-dir", required=True, help="Directory containing beam_properties_*.hdf5 files.")
+    ap.add_argument("--out", required=True, help="Output directory for the PNG plot.")
+    args = ap.parse_args()
+    main(args)
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_cumulative_beam_widths.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_individual_mpxi.py =====
+
+"""
+check_individual_mpxi.py
+--------------------------------
+* **Figure 1:** Histogram of *all* valid beam FWHM values (mm) with mean/median markers.
+* **Figure 2:** Bar-chart showing **how many detector units have *k* beams** (k = 1, 2, 3 …).
+* Prints the number of detectors that host at least one beam in the 2–5 mm “good-width” window.
+
+Run e.g.
+```bash
+python check_individual_mpxi.py \
+       --props  ../../../data/mph_hourglass_single_position_base_2mm_20pinholes_rotated_18custom_rot/outputs/beams_properties_configuration_00.hdf5 \
+       --masks  ../../../data/mph_hourglass_single_position_base_2mm_20pinholes_rotated_18custom_rot/outputs/beams_masks_configuration_00.hdf5 \
+       --out    ../../../data/mph_hourglass_single_position_base_2mm_20pinholes_rotated_18custom_rot/plots
+```
+"""
+
+import argparse, os, h5py, numpy as np, matplotlib.pyplot as plt
+import torch
+
+# ------------------------------------------------------------------ #
+
+def read_columns(h5_path: str, desired: list[str]) -> dict[str, torch.Tensor]:
+    """Return selected columns from beam_properties HDF5 as tensors."""
+    with h5py.File(h5_path, "r") as f:
+        # Handle case where header might be bytes
+        header = [h.decode('utf-8') if isinstance(h, bytes) else h for h in f["beam_properties"].attrs["Header"]]
+        data   = torch.from_numpy(f["beam_properties"][:])
+    cols: dict[str, torch.Tensor] = {}
+    for name in desired:
+        if name not in header:
+            raise RuntimeError(f"Column '{name}' not found in {h5_path}")
+        cols[name] = data[:, header.index(name)]
+    return cols
+
+# ------------------------------------------------------------------ #
+
+def main(args):
+    # -- read FWHM and detector‑ID columns ---------------------------
+    print(f"Reading properties from: {args.props}")
+    cols   = read_columns(args.props, ["FWHM (mm)", "detector unit id"])
+    fwhm_raw = cols["FWHM (mm)"].numpy()
+    det_id_raw = cols["detector unit id"].to(torch.int64)
+
+    # --- ADDED: Debugging print to show the raw data ---
+    print(f"First 10 raw FWHM values read from file: {fwhm_raw[:10]}")
+    # ----------------------------------------------------
+
+    # --- IMPORTANT: Filter out NaN values from FWHM ---
+    # This handles cases where FWHM calculation failed for a beam
+    valid_fwhm_mask = ~np.isnan(fwhm_raw)
+    fwhm = fwhm_raw[valid_fwhm_mask]
+    det_id = det_id_raw[valid_fwhm_mask] # det_id is now a torch.Tensor
+    
+    print(f"Read {len(fwhm_raw)} total beam entries.")
+    print(f"Found {len(fwhm)} beams with a valid FWHM value.")
+
+    # -- detectors that have at least one 2‑5 mm beam ---------------
+    if len(fwhm) > 0:
+        good_width_mask = (fwhm >= 2.0) & (fwhm <= 5.0)
+        # Apply the mask to the valid detector IDs before finding unique ones
+        n_good_det = torch.unique(det_id[good_width_mask]).numel()
+        print(f"Detectors with ≥1 beam in 2–5 mm window: {n_good_det}")
+    else:
+        print("No valid FWHM values to analyze.")
+        n_good_det = 0
+
+    # ------------------ Figure 1 – FWHM histogram ------------------
+    os.makedirs(args.out, exist_ok=True)
+    fig1, ax1 = plt.subplots(figsize=(7,4), layout="constrained")
+    
+    # Plot histogram only with valid FWHM values
+    if len(fwhm) > 0:
+        ax1.hist(fwhm, bins=30, color="#4c72b0", alpha=0.85)
+        mean_v, med_v = fwhm.mean(), np.median(fwhm)
+        ax1.axvline(mean_v, color="red",   ls="--", lw=1.5, label=f"Mean {mean_v:.2f} mm")
+        ax1.axvline(med_v,  color="green", ls=":",  lw=1.5, label=f"Median {med_v:.2f} mm")
+        ax1.legend()
+    else:
+        ax1.text(0.5, 0.5, "No valid FWHM data to plot", ha='center', va='center')
+
+    ax1.set_xlabel("Beam FWHM (mm)")
+    ax1.set_ylabel("Number of beams")
+    ax1.set_title("Distribution of Beam Widths (all valid beams)")
+    
+    out1 = os.path.join(args.out, "beam_width_histogram.png")
+    fig1.savefig(out1, dpi=300)
+    plt.close(fig1)
+    print(f"Saved → {out1}")
+
+    # ------------- Figure 2 – beams‑per‑detector bar chart ----------
+    if args.masks:
+        print(f"Reading masks from: {args.masks}")
+        with h5py.File(args.masks, "r") as f:
+            masks = torch.from_numpy(f["beam_mask"][:])
+        
+        # Count beams per detector by finding unique non-zero IDs in each mask row
+        # counts[i] = number of beams on detector 'i'
+        counts = torch.tensor([(row.unique().numel() - 1) for row in masks])
+
+        # How many detectors have k beams? (k = 1…max)
+        if counts.numel() > 0 and counts.max() > 0:
+            max_k  = int(counts.max().item())
+            det_per_k = torch.bincount(counts, minlength=max_k+1)[1:]  # drop k=0 count
+            ks = np.arange(1, max_k+1) # These are the k-values we will plot
+
+            print("\nDetectors by beam count:")
+            for k, c in zip(ks, det_per_k.tolist()):
+                print(f"  k={k}: {c} detectors")
+
+            fig2, ax2 = plt.subplots(figsize=(6,4), layout="constrained")
+            bars = ax2.bar(ks, det_per_k.numpy(), color="#55a868", alpha=0.9)
+            for bar, val in zip(bars, det_per_k.tolist()):
+                ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                         str(val), ha="center", va="bottom", fontsize=9)
+            ax2.set_xlabel("Number of beams per detector (k)")
+            ax2.set_ylabel("Number of detectors")
+            ax2.set_title("Beam Multiplicity Distribution")
+            ax2.set_xticks(ks if max_k < 10 else np.arange(1, max_k + 1, 2)) # Adjust ticks for many bars
+
+            out2 = os.path.join(args.out, "detector_beam_counts.png")
+            fig2.savefig(out2, dpi=300)
+            plt.close(fig2)
+            print(f"Saved → {out2}")
+
+            # --------------------------------------------------------------- #
+            # --- START: NEW CODE FOR FIGURE 3 (FWHM Histograms by k) ---
+            # --------------------------------------------------------------- #
+            print("\nGenerating FWHM histograms by multiplexing degree (k)...")
+            
+            # We need to find the multiplexing degree (k) for each beam's host detector
+            # 'fwhm' is a numpy array of valid FWHMs
+            # 'det_id' is a torch tensor of the corresponding detector IDs
+            # 'counts' is a torch tensor where counts[i] is the k-value for detector i
+            
+            beam_k_values_np = None
+            try:
+                # Use det_id to index into counts, getting the k-value for each beam
+                beam_k_values = counts[det_id] 
+                beam_k_values_np = beam_k_values.numpy()
+            except IndexError:
+                print(f"  ERROR: A detector ID from {args.props} (max: {det_id.max().item()})")
+                print(f"  is out of bounds for the masks file (num detectors: {counts.numel()}).")
+                print("  This can happen if props and masks files do not match.")
+                print("  Skipping Figure 3.")
+
+            if beam_k_values_np is not None:
+                # ks = np.arange(1, max_k+1) is already defined above
+                n_cols = max_k
+                
+                # Create the 1-row, n_cols-column grid
+                fig3, axes3 = plt.subplots(
+                    1, n_cols, 
+                    figsize=(n_cols * 4, 4.5), # Width scales with number of plots
+                    layout="constrained", 
+                    sharey=True # Share Y-axis for easier comparison
+                )
+                
+                # Handle case where n_cols=1 (max_k=1), plt.subplots returns a single Ax
+                if n_cols == 1:
+                    axes3 = [axes3]
+                
+                print(f"  Plotting {n_cols} histograms for k=1 to {max_k}...")
+
+                # Iterate from k=1 to max_k
+                for k, ax in zip(ks, axes3):
+                    # Find all FWHM values for beams where the detector's k-value matches
+                    fwhm_for_k = fwhm[beam_k_values_np == k]
+                    n_beams_k = len(fwhm_for_k)
+                    
+                    ax.set_title(f"k = {k} (N={n_beams_k} beams)")
+                    ax.set_xlabel("FWHM (mm)")
+                    
+                    if n_beams_k > 0:
+                        ax.hist(fwhm_for_k, bins=20, color="#c44e52", alpha=0.85)
+                        mean_v, med_v = fwhm_for_k.mean(), np.median(fwhm_for_k)
+                        ax.axvline(mean_v, color="blue",  ls="--", lw=1.5, label=f"Mean {mean_v:.2f}")
+                        ax.axvline(med_v,  color="black", ls=":",  lw=1.5, label=f"Median {med_v:.2f}")
+                        ax.legend(fontsize="small")
+                    else:
+                        # Plot empty text if no beams found for this k
+                        ax.text(0.5, 0.5, "No valid beams", 
+                                ha='center', va='center', transform=ax.transAxes)
+                
+                # Set Y-label only on the first plot
+                axes3[0].set_ylabel("Number of beams")
+                fig3.suptitle("FWHM Distribution by Detector Multiplexing Degree (k)", fontsize=16)
+
+                out3 = os.path.join(args.out, "fwhm_by_multiplexing_grid.png")
+                fig3.savefig(out3, dpi=300)
+                plt.close(fig3)
+                print(f"Saved → {out3}")
+            # --------------------------------------------------------------- #
+            # --- END: NEW CODE FOR FIGURE 3 ---
+            # --------------------------------------------------------------- #
+
+        else:
+            print("\nNo beams found in the masks file to generate multiplicity plot.")
+    else:
+        print("\n--masks file not provided, skipping Figure 2 and Figure 3.")
+
+# ------------------------------------------------------------------ #
+
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Beam-width histogram and detector beam-count plot.")
+    ap.add_argument("--props", required=True, help="beam_properties_*.hdf5 file")
+    ap.add_argument("--masks", default=None, help="beams_masks_*.hdf5 file (needed for Figure 2)")
+    ap.add_argument("--out",   required=True, help="output directory for PNGs")
+    args = ap.parse_args()
+    main(args)
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/check_individual_mpxi.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/convex_hull_helper.py =====
+from torch import atan2, argsort, cat, unique as torch_unique, vstack, Tensor
+
+
+def get_three_p_cross(points: Tensor) -> Tensor:
+    return (
+        points[1, 0] * (points[2, 1] - points[0, 1])
+        + points[2, 0] * (points[0, 1] - points[1, 1])
+        + points[0, 0] * (points[1, 1] - points[2, 1])
+    )
+
+
+def sort_points_by_xy_2d_batch(points_batch: Tensor, main_axis: int = 0) -> Tensor:
+    # Get unique x values
+    unique_x, unique_x_index = torch_unique(
+        points_batch[:, :, 0], return_inverse=True, sorted=True
+    )
+    unique_y, unique_y_index = torch_unique(
+        points_batch[:, :, 1], return_inverse=True, sorted=True
+    )
+    # Sort the indices based on x and y values
+    indices_by_xy = argsort(unique_x_index * 100 + unique_y_index)
+    return points_batch.gather(1, indices_by_xy.unsqueeze(-1).expand(-1, -1, 2))
+
+
+def sort_points_by_rad_2d_batch(points_batch: Tensor) -> Tensor:
+    # sort the vertices by angle to point ref_point
+    n_points = points_batch.shape[1] - 1
+    ref_points_batch = points_batch[:, 0].unsqueeze(1).expand(-1, n_points, -1)
+
+    rads = atan2(
+        points_batch[:, 1:, 1] - ref_points_batch[:, :, 1],
+        points_batch[:, 1:, 0] - ref_points_batch[:, :, 0],
+    )
+    # rads = rads + (rads < 0) * (2 * torch.pi)
+    order = argsort(rads, dim=1)
+    output = cat(
+        (
+            points_batch[:, :1],
+            points_batch[:, 1:, :].gather(
+                dim=1, index=order.unsqueeze(-1).expand(-1, -1, 2)
+            ),
+        ),
+        dim=1,
+    )
+    return output
+
+
+def sort_points_by_rad_2d(points: Tensor) -> Tensor:
+    # sort the vertices by angle to point ref_point
+    n_points = points.shape[1] - 1
+    ref_point = points[0]
+
+    rads = atan2(
+        points[1:, 1] - ref_point[1],
+        points[1:, 0] - ref_point[0],
+    )
+    # rads = rads + (rads < 0) * (2 * torch.pi)
+    output = cat(
+        (
+            points[0].unsqueeze(0),
+            points[1:][argsort(rads, dim=0)],
+        )
+    )
+    return output
+
+
+def sort_points_by_xy(points: Tensor) -> Tensor:
+    # Get unique x values
+    _, unique_x_index = torch_unique(points[:, 0], return_inverse=True, sorted=True)
+    _, unique_y_index = torch_unique(points[:, 1], return_inverse=True, sorted=True)
+    # Sort the indices based on x and y values
+    indices_by_xy = argsort(unique_x_index * 100 + unique_y_index)
+    return points[indices_by_xy]
+
+
+def sort_points_for_hull_2d(points: Tensor):
+    # Sort the points by x and y
+    sorted_points = sort_points_by_xy(points)
+    # Sort the points by angle reference to the first point
+    output = sort_points_by_rad_2d(sorted_points)
+    return output
+
+
+def sort_points_for_hull_batch_2d(points_batch: Tensor):
+    """
+    Sort the points in a batch of 2D points for convex hull computation.
+
+    Parameters
+    ----------
+    points_batch : torch.Tensor, shape (n_batch, n_points, 2)
+        The batch of points to be sorted.
+
+    Returns
+    -------
+    output: torch.Tensor, shape (n_batch, n_points, 2)
+    """
+
+    # sort the points by x and y
+    sorted_points_batch = sort_points_by_xy_2d_batch(points_batch)
+    # sort the points by angle reference to the first point
+    output = sort_points_by_rad_2d_batch(sorted_points_batch)
+    return output
+
+
+def convex_hull_2d(sorted_points: Tensor):
+    """
+    Compute the convex hull of a set of 2D points using the Monotone Chain algorithm.
+    Parameters
+    ----------
+    sorted_points : torch.Tensor, shape (n_points, 2)
+        The sorted points to compute the convex hull from.
+    Returns
+    -------
+    convex_hull : torch.Tensor, shape (n_hull_points, 2)
+        The points of the convex hull.
+    """
+
+    # get the convex hull
+    convex_hull = sorted_points[:2]
+    for i in range(2, sorted_points.shape[0]):
+        convex_hull = vstack((convex_hull, sorted_points[i]))
+        if convex_hull.shape[0] > 1 and get_three_p_cross(convex_hull[-3:]) <= 0:
+            convex_hull = vstack([convex_hull[:-2], convex_hull[-1]])
+    return convex_hull
+
+
+def detector_units_fov_sorted_points_batch(
+    detector_units_vertices: Tensor,
+    fov_vertices: Tensor,
+) -> Tensor:
+    """
+    Compute the convex hull of the FOV and the detector unit vertices. Batch version.
+
+    Parameters
+    ----------
+    detector_unit_vertices : torch.Tensor, shape (n_batch, 4, 2)
+        The vertices of the detector unit.
+    fov_vertices : torch.Tensor, shape (1, n_fov_points, 2)
+        The vertices of the FOV.
+
+    Returns
+    -------
+    points : torch.Tensor, shape (n_batch, n_hull_points, 2)
+        The points of the convex hull.
+    """
+    n_batch = detector_units_vertices.shape[0]
+
+    points_batch = cat(
+        (
+            fov_vertices.expand(n_batch, -1, -1),
+            detector_units_vertices,
+        ),
+        dim=1,
+    )
+    return sort_points_for_hull_batch_2d(points_batch)
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/convex_hull_helper.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_io.py =====
+import os
+
+from torch import Tensor
+from torch import load as torch_load
+
+
+def load_scanner_layouts(dirname: str, filename: str):
+
+    import os
+
+    full_path = os.path.join(dirname, filename)
+    if not os.path.exists(full_path):
+        print(f"File {full_path} does not exist.")
+        raise FileNotFoundError(f"File {full_path} does not exist.")
+    filename_unique_id = filename.split(".")[0].split("_")[-1]
+    scanner_layouts_data = torch_load(full_path, weights_only=True)["layouts"]
+    return scanner_layouts_data, filename_unique_id
+
+
+def load_scanner_layout_geometries(layout_idx: int, scanner_layouts_data):
+    # Load the scanner geometry
+    plates_vertices: Tensor = scanner_layouts_data[f"position {layout_idx:03d}"][
+        "plate segments"
+    ]
+    detector_units_vertices: Tensor = scanner_layouts_data[
+        f"position {layout_idx:03d}"
+    ]["detector units"]
+    return plates_vertices, detector_units_vertices
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_io.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_plot.py =====
+import torch
+import matplotlib
+from matplotlib.axes import Axes
+from matplotlib.collections import (
+    PolyCollection,
+)
+from matplotlib import colors as mpl_colors
+from typing import Dict
+
+# import numpy as np
+
+
+def plot_polygons_from_vertices_mpl(vertices: torch.Tensor, ax: Axes, **kwargs):
+    p = PolyCollection(vertices.tolist(), **kwargs)
+    ax.add_collection(p)
+    return p
+
+
+def get_fov_corners(fov_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    fov_size_in_mm = fov_dict["size in mm"]
+    fov_corners = torch.tensor(
+        [
+            [-1, -1],
+            [1, -1],
+            [1, 1],
+            [-1, 1],
+        ]
+    )
+    fov_corners = (
+        fov_corners * fov_size_in_mm * 0.5 + fov_dict["center coordinates in mm"]
+    )
+
+    return fov_corners
+
+
+def plot_fov_as_rectangle_mpl(fov_dict: dict, ax: Axes, **kwargs):
+    fov_corners = get_fov_corners(fov_dict)
+    return plot_polygons_from_vertices_mpl(fov_corners.unsqueeze(0), ax, **kwargs)
+
+
+def plot_scanner_from_vertices_2d_mpl(
+    plate_polygon_tensor, xtal_polygon_tensor, ax, fov_dict
+):
+
+    plate_polycoll = plot_polygons_from_vertices_mpl(
+        plate_polygon_tensor, ax, color="b", alpha=0.5
+    )
+    crystal_polycoll = plot_polygons_from_vertices_mpl(
+        xtal_polygon_tensor, ax, color="orange", alpha=0.5
+    )
+    fov_polycoll = plot_fov_as_rectangle_mpl(fov_dict, ax, fc="none", ec="g", alpha=0.5)
+    ax.autoscale()
+    return {
+        "plate polygon collection": plate_polycoll,
+        "crystal polygon collection": crystal_polycoll,
+        "fov polygon collection": fov_polycoll,
+    }
+
+
+def plot_new_ppdf_mpl(ppdf_data, ax, fov_dict, **kwargs):
+    original_cmap = matplotlib.colormaps.get(kwargs.get("cmap", "hot_r"))
+    start = 0.0
+    end = 0.8  # End at 80% of the original colormap
+    n_colors = 256  # Number of colors in the new colormap
+    # Sample colors from the original colormap
+    if original_cmap is not None:
+        colors_from_map = original_cmap(torch.linspace(start, end, n_colors).tolist())
+
+        # Create the new colormap
+        new_cmap = mpl_colors.LinearSegmentedColormap.from_list(
+            f"{original_cmap.name}[{start:.2f}-{end:.2f}]", colors_from_map
+        )
+        ppdf = ppdf_data.view(
+            int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1])
+        )
+
+        im = ax.imshow(
+            ppdf.T,
+            origin="lower",
+            extent=(-64, 64, -64, 64),
+            aspect="equal",
+            vmin=0,
+            cmap=new_cmap,
+            **kwargs,
+        )
+        cb = ax.figure.colorbar(im, ax=ax)
+        cb.ax.ticklabel_format(style="scientific", axis="y", scilimits=(0, 0))
+        return im
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_plot.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_utils.py =====
+from typing import Dict, Sequence
+
+from torch import Tensor, arange, atan2, float32
+from torch import max as torch_max
+from torch import meshgrid, pi, stack, tensor
+from torch.nn import functional as F
+
+
+def local_max_1d(data: Tensor, size: int = 3):
+    """
+    Get the local max of a 1D tensor with a given factor.
+    """
+    data_padded = F.pad(
+        data.view(1, 1, -1), (size // 2, size // 2), mode="constant", value=0
+    ).squeeze()
+    return torch_max(data_padded.unfold(0, size, 1), dim=1).values
+
+
+def fov_tensor_dict(
+    n_pixels: Sequence[int] = (512, 512),
+    mm_per_pixel: Sequence[float] = (0.25, 0.25),
+    center_coordinates: Sequence[float] = (0.0, 0.0),
+) -> dict:
+    """
+    Create a dictionary with the FOV information.
+    """
+    fov_dict = {
+        "n pixels": tensor([n_pixels[0], n_pixels[1]]),
+        "mm per pixel": tensor([mm_per_pixel[0], mm_per_pixel[1]]),
+        "center coordinates in mm": tensor([center_coordinates[0], center_coordinates[1]]),
+    }
+    fov_dict["size in mm"] = fov_dict["n pixels"] * fov_dict["mm per pixel"]
+    return fov_dict
+
+
+def pixels_coordinates(
+    fov_dict: Dict,
+) -> Tensor:
+
+    pixel_indices = stack(
+        meshgrid(
+            arange(0, int(fov_dict["n pixels"][0])),
+            arange(0, int(fov_dict["n pixels"][1])),
+            indexing="ij",
+        ),
+        dim=2,
+    ).view(-1, 2)
+    return (
+        pixel_indices.to(dtype=float32) * fov_dict["mm per pixel"]
+        - fov_dict["size in mm"] * 0.5
+        + fov_dict["center coordinates in mm"]
+    )
+
+
+def pixels_to_detector_unit_rads(
+    pixel_coordinates: Tensor,
+    detector_unit_center: Tensor,
+) -> Tensor:
+
+    pixel_rads = atan2(
+        pixel_coordinates[:, 1] - detector_unit_center[1],
+        pixel_coordinates[:, 0] - detector_unit_center[0],
+    )
+    pixel_rads = pixel_rads + 2 * pi * (pixel_rads < 0)
+    if pixel_rads.max() - pixel_rads.min() > pi:
+        pixel_rads[pixel_rads > pi] -= 2 * pi
+    return pixel_rads
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/geometry_2d_utils.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/parallel_beam_props.sh =====
+#!/bin/bash
+
+#SBATCH --job-name=beam_gen        # Job name for identification
+#SBATCH --cluster=ub-hpc
+#SBATCH --partition=general-compute
+#SBATCH --qos=nih
+#SBATCH --time=02:00:00             # Walltime limit (HH:MM:SS), e.g., 2 hours
+#SBATCH --nodes=1                   # Run all tasks on a single node
+#SBATCH --ntasks=1                  # Request 1 task (our python script)
+#SBATCH --cpus-per-task=1           # Request 1 CPU core per task
+#SBATCH --mem=5G                    # Request 3 GB of memory per task
+#SBATCH --array=0-14            
+
+# --- Output/Error Logging ---
+# Create a directory for logs
+mkdir -p slurm_logs
+# %A is the main job ID, %a is the array task ID
+#SBATCH --output=slurm_logs/beam_proc_%A_%a.out
+#SBATCH --error=slurm_logs/beam_proc_%A_%a.err
+
+# --- Environment Setup ---
+echo "=========================================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job Array Task ID: $SLURM_ARRAY_TASK_ID"
+echo "Running on host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Start Time: $(date)"
+echo "=========================================================="
+
+# Activate your Python environment (e.g., Conda)
+source /user/htripath/venv/bin/activate
+ml intel gcccore/11.2.0 python/3.9.6-bare hdf5/1.14.1
+pip install --user mpi4py
+CC=mpicc HDF5_MPI="ON" HDF5_DIR="/cvmfs/soft.ccr.buffalo.edu/versions/2023.01/easybuild/software/avx512/MPI/intel/2022.0.1/impi/2021.5.0/hdf5/1.14.1" pip install --user --no-binary=h5py h5py  
+
+# --- Execute the Python Script ---
+# Slurm will run this command for each task in the array,
+# substituting $SLURM_ARRAY_TASK_ID with the current index (0, 1, ... 5).
+# Step 1: Generate Beam Masks
+echo "--- [START] Step 1: Generating Beam Masks for layout $SLURM_ARRAY_TASK_ID ---"
+python arg_extract_beam_masks.py $SLURM_ARRAY_TASK_ID
+echo "--- [ END ] Step 1: Finished Beam Masks for layout $SLURM_ARRAY_TASK_ID ---"
+echo ""
+
+# Step 2: Extract Beam Properties (depends on Step 1)
+echo "--- [START] Step 2: Extracting Beam Properties for layout $SLURM_ARRAY_TASK_ID ---"
+python arg_extract_beam_properties.py $SLURM_ARRAY_TASK_ID
+echo "--- [ END ] Step 2: Finished Beam Properties for layout $SLURM_ARRAY_TASK_ID ---"
+echo ""
+
+# Step 3: Generate ASCI Histogram (depends on Steps 1 & 2)
+echo "--- [START] Step 3: Generating ASCI Histogram for layout $SLURM_ARRAY_TASK_ID ---"
+python arg_analyze_extracted_properties.py $SLURM_ARRAY_TASK_ID
+echo "--- [ END ] Step 3: Finished ASCI Histogram for layout $SLURM_ARRAY_TASK_ID ---"
+echo ""
+
+
+echo "=========================================================="
+echo "End Time: $(date)"
+echo "=========================================================="
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/parallel_beam_props.sh =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/plot_sensitivity_map.py =====
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+import os
+
+def load_ppdfs_for_layout(ppdf_dir: str, layout_idx: int, n_xtals_to_load: int = -1):
+    """Loads PPDFs from an HDF5 file for a specific layout."""
+    ppdf_filename = os.path.join(ppdf_dir, f"scanner_layouts_step0x0_layout_{layout_idx:03d}_3x3_subvoxels.hdf5")
+    if not os.path.exists(ppdf_filename):
+        print(f"PPDF file {ppdf_filename} does not exist.")
+        return None
+    
+    with h5py.File(ppdf_filename, "r") as f:
+        # Selects all crystals if n_xtals_to_load is -1, otherwise slices the array
+        ppdfs_data = f["ppdfs"][:n_xtals_to_load] if n_xtals_to_load != -1 else f["ppdfs"][:]
+    return ppdfs_data
+
+def create_and_plot_sensitivity_histogram(sensitivity_map: np.ndarray, output_dir: str, file_suffix: str, title_suffix: str):
+    """Generates and displays a histogram for a given sensitivity map."""
+    # --- 1. Prepare Data: Filter for values within the FOV ---
+    fov_values = sensitivity_map[sensitivity_map > 0].flatten()
+    if fov_values.size == 0:
+        print("Warning: The sensitivity map contains no non-zero values.")
+        return
+
+    # --- 2. Create and Plot the Histogram ---
+    plt.figure(figsize=(10, 6))
+    plt.hist(fov_values, bins=100, color='royalblue', alpha=0.75)
+    plt.title(f'Histogram of Sensitivity Values - {title_suffix}')
+    plt.xlabel('Sensitivity')
+    plt.ylabel('Number of Pixels (Frequency)')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    mean_sensitivity = np.mean(fov_values)
+    plt.axvline(mean_sensitivity, color='red', linestyle='dashed', linewidth=2, label=f'Mean: {mean_sensitivity:.4f}')
+    plt.legend()
+    plt.tight_layout()
+
+    # --- 3. Save the Histogram Plot ---
+    hist_filename = os.path.join(output_dir, f"sensitivity_histogram_{file_suffix}.png")
+    plt.savefig(hist_filename)
+    print(f"Saved sensitivity histogram to: {hist_filename}")
+    plt.close()
+
+
+if __name__ == "__main__":
+    # --- Configuration ---
+    ppdf_files_base_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdfs/ppdfs_15rots_3mm_aperture_displaced_24ph"
+    plot_dir = "/vscratch/grp-rutaoyao/Harsh/patch_based_recon/metrics/metrics_3mm_aperture_displaced_24ph"
+    num_layouts_to_load = 15
+    layout_indices = list(range(num_layouts_to_load))
+
+    FOV_PIXELS_X, FOV_PIXELS_Y = 280, 280
+    MM_PER_PIXEL_X, MM_PER_PIXEL_Y = 0.25, 0.25
+    num_crystals_to_sum = -1
+    # --- End Configuration ---
+
+    if not os.path.isdir(ppdf_files_base_dir):
+        print(f"Error: PPDF directory '{ppdf_files_base_dir}' not found.")
+        exit()
+
+    # --- Loop through layouts, load, and aggregate ---
+    print(f"Loading and aggregating PPDFs for layouts: {layout_indices}...")
+    aggregated_ppdfs = None
+    successful_loads = 0 # NEW: Counter for successfully loaded layouts
+
+    for idx in layout_indices:
+        print(f"  - Loading layout {idx:03d}...")
+        ppdfs_for_layout = load_ppdfs_for_layout(ppdf_files_base_dir, idx, num_crystals_to_sum)
+        
+        if ppdfs_for_layout is None:
+            print(f"Warning: Could not load data for layout {idx}. Skipping.")
+            continue
+            
+        if aggregated_ppdfs is None:
+            aggregated_ppdfs = ppdfs_for_layout.astype(np.float32)
+        else:
+            aggregated_ppdfs += ppdfs_for_layout
+        
+        successful_loads += 1 # NEW: Increment the counter on a successful load
+
+    if aggregated_ppdfs is None:
+        print("Error: No PPDF data was successfully loaded. Exiting.")
+        exit()
+    
+    print(f"\nAggregation complete. Successfully loaded {successful_loads} layouts.")
+
+    # --- Generate and NORMALIZE the sensitivity map ---
+    if successful_loads > 0:
+        # UPDATED: Divide by the number of successful loads to get the average
+        sensitivity_map_1d = np.sum(aggregated_ppdfs, axis=0) / successful_loads
+    else:
+        # This case is already handled by the exit above, but it's good practice
+        sensitivity_map_1d = np.zeros(FOV_PIXELS_X * FOV_PIXELS_Y)
+
+    sensitivity_map_2d = sensitivity_map_1d.reshape((FOV_PIXELS_Y, FOV_PIXELS_X))
+            
+    # Determine plot extent
+    extent = [-(MM_PER_PIXEL_X * FOV_PIXELS_X / 2), (MM_PER_PIXEL_X * FOV_PIXELS_X / 2),
+              -(MM_PER_PIXEL_Y * FOV_PIXELS_Y / 2), (MM_PER_PIXEL_Y * FOV_PIXELS_Y / 2)]
+
+    # --- Create descriptive names for aggregated output files and titles ---
+    layouts_str_fname = f"aggregated_{successful_loads}layouts_normalized"
+    layouts_str_title = f"Normalized Sensitivity Map ({successful_loads} Layouts)"
+
+    # Plot and Save the Aggregated and Normalized Sensitivity Map Image
+    plt.figure(figsize=(8, 7))
+    plt.imshow(sensitivity_map_2d, cmap='viridis', origin='lower', extent=extent)
+    plt.colorbar(label='Average Sensitivity (Normalized)')
+    plt.title(layouts_str_title)
+    plt.xlabel('X (mm)'); plt.ylabel('Y (mm)')
+    plt.axhline(0, color='white', linestyle=':', lw=0.5); plt.axvline(0, color='white', linestyle=':', lw=0.5)
+    plt.tight_layout()
+    map_filename = os.path.join(plot_dir, f"sensitivity_map_{layouts_str_fname}.png")
+    plt.savefig(map_filename)
+    print(f"\nSaved normalized sensitivity map to: {map_filename}")
+    plt.close()
+    
+    # NEW: Also create a histogram for the normalized data
+    create_and_plot_sensitivity_histogram(sensitivity_map_2d, plot_dir, layouts_str_fname, layouts_str_title)
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/plot_sensitivity_map.py =====
+
+===== BEGIN /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/ppdf_io.py =====
+import os
+
+from torch import Tensor
+from torch import empty as empty_tensor
+from torch import float32, tensor
+
+
+def load_ppdfs_data_from_hdf5(
+    dataset_dir: str, hdf5_filename: str, fov_dict: dict
+) -> Tensor:
+    import h5py
+
+    # Check if the file exists
+    if not os.path.exists(os.path.join(dataset_dir, hdf5_filename)):
+        print(f"File {hdf5_filename} does not exist in {dataset_dir}.")
+        raise FileNotFoundError(
+            f"File {hdf5_filename} does not exist in {dataset_dir}."
+        )
+    ppdfs = empty_tensor(
+        (fov_dict["n pixels"][0], fov_dict["n pixels"][1], 2), dtype=float32
+    )
+    with h5py.File(os.path.join(dataset_dir, hdf5_filename), "r") as f:
+        # Print the names of all datasets in the file
+        # print("Datasets in the file:")
+        #  for name in f:
+        #      print(name)
+        ppdfs = f["ppdfs"][:]
+        ppdfs = tensor(ppdfs)
+    return ppdfs
+
+===== END /vscratch/grp-rutaoyao/Harsh/patch_based_recon/ppdf-beam-analysis/ppdf_io.py =====
