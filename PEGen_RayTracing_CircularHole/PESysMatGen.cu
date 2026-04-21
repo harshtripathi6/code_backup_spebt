@@ -952,11 +952,16 @@ __global__ void photodetectorCudaMe(float* dst,
 	float* deviceparameter_Collimator,
 	float* deviceparameter_Detector,
 	float* deviceparameter_Image,
-	int numProjectionSingle,
-	int numImagebin)
+	long long numProjectionSingle,
+	long long numImagebin)
 
 {
-
+	long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long totalElements = (long long)numProjectionSingle * numImagebin;
+    if (tid >= totalElements) { return; }
+    // Recover 2D indices
+    int row = (int)(tid / numImagebin);   // detector index
+    int col = (int)(tid % numImagebin);   // voxel index
 	
 	float _float_numCollimatorLayer = deviceparameter_Collimator[0];
 	float _float_numDetectorBins = deviceparameter_Detector[0];
@@ -1011,18 +1016,16 @@ __global__ void photodetectorCudaMe(float* dst,
 	int numImageVoxelX = (int)floor(_float_numImageVoxelX);
 	int numImageVoxelY = (int)floor(_float_numImageVoxelY);
 	int numImageVoxelZ = (int)floor(_float_numImageVoxelZ);
-
-
-	int row = blockIdx.x * blockDim.x + threadIdx.x;
-	if (row < 0 || row > numProjectionSingle - 1) { return; }
-	int col = blockIdx.y * blockDim.y + threadIdx.y;
-	if (col < 0 || col > numImagebin - 1) { return; }
+	//int row = blockIdx.x * blockDim.x + threadIdx.x;
+	//if (row < 0 || row > numProjectionSingle - 1) { return; }
+	//int col = blockIdx.y * blockDim.y + threadIdx.y;
+	//if (col < 0 || col > numImagebin - 1) { return; }
 
 
 	//PSF
 	//int dstIndex = col * numProjectionSingle + row;
 	//DRF
-	int dstIndex = row * numImagebin + col;
+	long long dstIndex = (long long)row * numImagebin + col;
 
 
 	unsigned int idxDetector = row;
@@ -1085,6 +1088,7 @@ __global__ void photodetectorCudaMe(float* dst,
 	//计算探测器微元单位和编码孔在像素中心球面上的投影，缩小遍历范围
 	unsigned int numcrossDetector = 0;
 	unsigned int Cross_Detector[3000];
+	//unsigned int Cross_Detector[50];
 	for (unsigned int i = 0; i < 3000; ++i)
 	{
 		Cross_Detector[i] = 0;
@@ -1092,6 +1096,7 @@ __global__ void photodetectorCudaMe(float* dst,
 
 	unsigned int numcrossCollimatorHole[10];
 	unsigned int Cross_CollimatorHole[1000][10];
+	//unsigned int Cross_CollimatorHole[150][10];
 	for (unsigned int id_CollimatorLayer = 0; id_CollimatorLayer < numCollimatorLayer; id_CollimatorLayer++)
 	{
 		numcrossCollimatorHole[id_CollimatorLayer] = 0;
@@ -1377,8 +1382,8 @@ int PESysMatGen(float* parameter_Collimator, float* parameter_Detector, float* p
 	int numPSFImageVoxelY = (int)floor(_float_numPSFImageVoxelY);
 	int numPSFImageVoxelZ = (int)floor(_float_numPSFImageVoxelZ);
 
-	int numProjectionSingle = (int)floor(parameter_Detector[0]+0.0001f);
-	int numImagebin = numPSFImageVoxelX * numPSFImageVoxelY * numPSFImageVoxelZ;
+	size_t numProjectionSingle = (int)floor(parameter_Detector[0]+0.0001f);
+	size_t numImagebin = numPSFImageVoxelX * numPSFImageVoxelY * numPSFImageVoxelZ;
 
 	
 	int deviceCount;
@@ -1393,8 +1398,8 @@ int PESysMatGen(float* parameter_Collimator, float* parameter_Detector, float* p
 	cout << "Set Device to Device " << cuda_id<< endl;
 
 	float* deviceMatrix, * deviceparameter_Collimator, * deviceparameter_Detector, * deviceparameter_Image;
-	cudaMalloc(&deviceMatrix, sizeof(float) * numProjectionSingle * numImagebin);
-	cudaMemset(deviceMatrix, 1, sizeof(float) * numProjectionSingle * numImagebin);
+	cudaMalloc(&deviceMatrix, sizeof(float) * (size_t)numProjectionSingle * numImagebin);
+	cudaMemset(deviceMatrix, 0, sizeof(float) * (size_t)numProjectionSingle * (size_t)numImagebin);
 	cudaMalloc(&deviceparameter_Collimator, sizeof(float) * 80000);
 	cudaMemcpy(deviceparameter_Collimator, parameter_Collimator, sizeof(float) * 80000, cudaMemcpyHostToDevice);
 	cudaMalloc(&deviceparameter_Detector, sizeof(float) * 80000);
@@ -1403,25 +1408,43 @@ int PESysMatGen(float* parameter_Collimator, float* parameter_Detector, float* p
 	cudaMemcpy(deviceparameter_Image, parameter_Image, sizeof(float) * 100, cudaMemcpyHostToDevice);
 
 
-	dim3 blockSize(16, 32);
-	dim3 gridSize((numProjectionSingle + 15) / blockSize.x, (numImagebin + 31) / blockSize.y);
+	//dim3 blockSize(16, 32);
+	//dim3 gridSize((numProjectionSingle + 15) / blockSize.x, (numImagebin + 31) / blockSize.y);
+	long long totalThreads = (long long)numProjectionSingle * (long long)numImagebin;
+	int threadsPerBlock = 256;
+	long long numBlocks = (totalThreads + threadsPerBlock - 1) / threadsPerBlock;
+	if (numBlocks > 2147483647LL) {
+        cerr << "ERROR: numBlocks exceeds CUDA grid limit!" << endl;
+        return -1;
+    }
 	cout << "########################" << endl;
 	cout << "numProjectionSingle = " << numProjectionSingle << endl;
 	cout << "numImagebin = " << numImagebin << endl;
-	cout << "gridSize.x = " << gridSize.x << endl;
-	cout << "gridSize.y = " << gridSize.y << endl;
+	//cout << "gridSize.x = " << gridSize.x << endl;
+	//cout << "gridSize.y = " << gridSize.y << endl;
 	cout << "########################" << endl;
 
-	photodetectorCudaMe <<<gridSize, blockSize >>> (
+	photodetectorCudaMe <<<numBlocks, threadsPerBlock>>> (
 		deviceMatrix,
 		deviceparameter_Collimator,
 		deviceparameter_Detector,
 		deviceparameter_Image,
-		numProjectionSingle,
-		numImagebin);
+		(long long)numProjectionSingle,
+		(long long)numImagebin);
+	cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cerr << "Kernel launch failed: " << cudaGetErrorString(err) << endl;
+        return -1;
+    }
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cerr << "Kernel execution failed: " << cudaGetErrorString(err) << endl;
+        return -1;
+    }	
 	//cudaThreadSynchronize();
 	//float* test = new float[80000];
-	cudaMemcpy(dst, deviceMatrix, sizeof(float) * numProjectionSingle * numImagebin, cudaMemcpyDeviceToHost);
+	cudaMemcpy(dst, deviceMatrix, sizeof(float) * (size_t)numProjectionSingle * (size_t)numImagebin, cudaMemcpyDeviceToHost);
 	//cudaMemcpy(test, deviceparameter_Collimator, sizeof(float) * 80000, cudaMemcpyDeviceToHost);
 
 	cout << "########################" << endl;

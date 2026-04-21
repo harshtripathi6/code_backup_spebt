@@ -1,0 +1,38 @@
+Starting Job: 24176709 on node cpn-f06-11
+Allocated GPU Hardware:
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-16688657-f64e-2d30-5a72-94e3fd817b39)
+----------------------------------------------------------
+Compiling GPU and CPU codes...
+Compilation successful. Launching GPUPTS simulation...
+############ Collimator 0 ############
+Number of collimator holes = 1218
+Width of collimator layer(X direction) = 140mm
+Thickness of collimator layer(Y direction) = 6mm
+Height of collimator layer(Z direction) = 140mm
+Collimator Layer to 1st Collimator Layer = 0mm
+Total Coeff of collimator layer = 4
+Photon-electric Coeff of collimator layer = 3.8
+Compton Coeff of collimator layer = 0.2
+FOV center to 1st Collimator = 67
+Allocating output: 11811160064 elements (47.24 GB)
+FOV dimension : 128 128 128
+FOV Voxel Size(mm) : 1.000000 1.000000 1.000000
+########################
+Rotation (0) processing ...
+########################
+Shift FOV in X = 0mm
+Shift FOV in Y = 0mm
+Shift FOV in Z = 0mm
+Get into PESysMatGen
+Device 0 has compute capability 9.0.
+Set Device to Device 0
+########################
+numProjectionSingle = 5632
+numImagebin = 2097152
+########################
+########################
+numImagebin = 2097152
+########################
+Photon Electric Sysmat Written.
+########################
+Simulation complete! Check the directory for output matrix files.

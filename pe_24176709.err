@@ -1,0 +1,12 @@
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) ccrenv   2) gentoo/2023.01   3) ccrsoft/2023.01
+
+The following have been reloaded with a version change:
+  1) ccrsoft/2023.01 => ccrsoft/2024.04     2) gentoo/2023.01 => gentoo/2024.04
+
+
+real	225m50.448s
+user	0m0.011s
+sys	0m0.010s
