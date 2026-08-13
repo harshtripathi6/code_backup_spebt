@@ -25,8 +25,10 @@ echo "Start: $(date)"
 echo "=========================================================="
 
 # --- Repo-local defaults (override via env vars if needed) ---
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data}"
+#REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/fov_150mm}"
 
 # Parallelism defaults (override via env vars)
 SLURM_CPUS="${SLURM_CPUS_PER_TASK:-16}"

@@ -120,8 +120,8 @@ def compute_pose(
     mu_dict = tensor([3.5, 0.5], device=default_device)
 
     # keep these consistent with recon grid
-    FOV_NPIX = (200, 200)
-    FOV_SIZE_MM = (10, 10)
+    FOV_NPIX = (20, 20)
+    FOV_SIZE_MM = (160.0, 160.0)
     SFOV_SUBDIV = (5, 5)
     CRYSTAL_SUBS = (1, 5)
     subdivision_grid = subdivision_grid_rectangle(CRYSTAL_SUBS)

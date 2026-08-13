@@ -1,0 +1,10 @@
+==========================================================
+Job ID: 25671178
+Array Task ID: 1
+Host: cpn-b04-24.core.ccr.buffalo.edu
+PWD: /vscratch/grp-rutaoyao/Harsh/2D_SAI
+Start: Sun Aug  9 04:24:01 PM EDT 2026
+==========================================================
+Running T8 for layout=1
+--- T8 PPDFs | layout=1 | selected poses=0,1,2,3,4,5,6,7 | a=0.8 b=0.8 ---
+[parallel] pose_workers=8 | torch_threads=2 | torch_interop_threads=1

@@ -1,0 +1,9 @@
+==========================================================
+Job ID: 25671172
+Array Task ID: 1
+Host: cpn-b04-24.core.ccr.buffalo.edu
+PWD: /vscratch/grp-rutaoyao/Harsh/2D_SAI
+Start: Sun Aug  9 04:20:01 PM EDT 2026
+==========================================================
+FATAL: LAYOUT_FILE not set and no /var/spool/slurmd/job25671172/data/scanner_layouts_*.tensor found.
+Generate one via: python /var/spool/slurmd/job25671172/generate_mph_scanner_circularfov.py --output_dir /var/spool/slurmd/job25671172/data
